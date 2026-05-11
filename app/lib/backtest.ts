@@ -3,6 +3,8 @@ import type {
   BacktestResult,
   BacktestSettings,
   Candle,
+  CandlePosition,
+  ChartSignal,
   IndicatorConfig,
   Strategy,
   StrategyCondition,
@@ -417,4 +419,103 @@ export function runBacktest(
     performance,
     equity,
   };
+}
+
+/**
+ * Lightweight "what does this strategy say?" pass used to drive on-chart
+ * signal markers. Mirrors `runBacktest`'s state machine (long/flat,
+ * alternating buy↔sell) but skips portfolio accounting, fees, equity tracking,
+ * and the force-close-at-end behaviour — none of which are meaningful when
+ * we're just annotating the chart with the moment a rule fired.
+ */
+export function computeStrategySignals(
+  candles: Candle[],
+  strategy: Strategy,
+): Array<{ time: number; type: 'BUY' | 'SELL' }> {
+  if (candles.length === 0) return [];
+  const pre = precompute(candles, strategy.indicators);
+  const out: Array<{ time: number; type: 'BUY' | 'SELL' }> = [];
+  let inLong = false;
+
+  for (let i = 0; i < candles.length; i++) {
+    const ctx: ConditionContext = {
+      candle: candles[i],
+      prevCandle: i > 0 ? candles[i - 1] : null,
+      candleIndex: i,
+      total: candles.length,
+      pre,
+      indicators: strategy.indicators,
+    };
+
+    const buy = !inLong
+      ? evaluateConditions(strategy.buyConditions, strategy.logic, ctx)
+      : false;
+    const sell = inLong
+      ? evaluateConditions(strategy.sellConditions, strategy.logic, ctx)
+      : false;
+
+    if (buy) {
+      out.push({ time: candles[i].time, type: 'BUY' });
+      inLong = true;
+    } else if (sell) {
+      out.push({ time: candles[i].time, type: 'SELL' });
+      inLong = false;
+    }
+  }
+  return out;
+}
+
+/**
+ * Walks the candle sequence with a precomputed signal list and returns the
+ * position state (`long` / `flat`) at every bar. Initial state is `flat`;
+ * each BUY flips it to `long` from that candle onward, each SELL flips it
+ * back to `flat`. Used by the chart's focused-indicator zone shading.
+ */
+export function computeCandlePositions(
+  candles: Candle[],
+  signals: ChartSignal[],
+): CandlePosition[] {
+  if (candles.length === 0) return [];
+  const sigByTime = new Map<number, 'BUY' | 'SELL'>();
+  for (const s of signals) sigByTime.set(s.time, s.type);
+  const out: CandlePosition[] = [];
+  let inLong = false;
+  for (const c of candles) {
+    const sig = sigByTime.get(c.time);
+    if (sig === 'BUY') inLong = true;
+    else if (sig === 'SELL') inLong = false;
+    out.push({ time: c.time, state: inLong ? 'long' : 'flat' });
+  }
+  return out;
+}
+
+/**
+ * Computes signals for each indicator independently, then merges by
+ * (time, type) — when two indicators agree at the same candle we keep one
+ * marker and attribute it to all sources.
+ */
+export function computeMultiIndicatorSignals(
+  candles: Candle[],
+  indicators: IndicatorConfig[],
+  strategyFor: (ind: IndicatorConfig) => Strategy,
+): ChartSignal[] {
+  if (candles.length === 0 || indicators.length === 0) return [];
+  const merged = new Map<string, ChartSignal>();
+  for (const ind of indicators) {
+    let signals: Array<{ time: number; type: 'BUY' | 'SELL' }>;
+    try {
+      const strategy = strategyFor(ind);
+      signals = computeStrategySignals(candles, strategy);
+    } catch (err) {
+      console.warn(`Signal calc failed for ${ind.type}:`, err);
+      continue;
+    }
+    for (const s of signals) {
+      const key = `${s.time}|${s.type}`;
+      if (!merged.has(key)) {
+        merged.set(key, { time: s.time, type: s.type, source: ind.type });
+      }
+    }
+  }
+  return Array.from(merged.values()).sort((a, b) => a.time - b.time);
 }

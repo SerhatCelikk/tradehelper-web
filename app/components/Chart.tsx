@@ -4,6 +4,7 @@ import {
   createChart,
   CrosshairMode,
   LineStyle,
+  LineType,
   type IChartApi,
   type ISeriesApi,
   type SeriesMarker,
@@ -11,13 +12,41 @@ import {
   type UTCTimestamp,
 } from 'lightweight-charts';
 import { useEffect, useRef } from 'react';
-import type { Candle, IndicatorConfig, IndicatorValues, Trade } from '../lib/types';
+import type {
+  Candle,
+  CandlePosition,
+  ChartSignal,
+  IndicatorConfig,
+  IndicatorValues,
+  Trade,
+} from '../lib/types';
 
 interface Props {
   data: Candle[];
   indicators: IndicatorConfig[];
   indicatorValues: IndicatorValues;
   trades?: Trade[];
+  /**
+   * Live indicator-driven buy/sell points. Rendered as small green/red
+   * circles (buy below the bar, sell above) so they sit within a single
+   * candle's width and don't compete visually with the larger backtest
+   * arrow markers.
+   */
+  signals?: ChartSignal[];
+  /**
+   * Per-candle position state for the focused indicator. Rendered as soft
+   * green ("long") and red ("flat") translucent bands behind the candles.
+   * Pass `undefined`/empty to hide zone shading.
+   */
+  zones?: CandlePosition[];
+  /**
+   * Decimal places to display on the price axis / crosshair / last-value
+   * label. Sourced from Binance's `tickSize` for the current symbol so
+   * dust-priced coins read as "0.00001234" instead of getting clipped to
+   * "0.00". Pair with `tickSize` so the axis snaps to actual increments.
+   */
+  pricePrecision?: number;
+  pricePrecisionTickSize?: number;
   /**
    * Identifier for the current dataset (typically `${symbol}|${timeframe}`).
    * Used to decide when to auto-fit the visible range. While this key stays
@@ -38,12 +67,18 @@ export default function Chart({
   indicators,
   indicatorValues,
   trades,
+  signals,
+  zones,
+  pricePrecision,
+  pricePrecisionTickSize,
   datasetKey,
 }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
   const candleSeriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null);
   const volumeSeriesRef = useRef<ISeriesApi<'Histogram'> | null>(null);
+  const longZoneRef = useRef<ISeriesApi<'Area'> | null>(null);
+  const flatZoneRef = useRef<ISeriesApi<'Area'> | null>(null);
   const overlayRefs = useRef<Map<string, ISeriesApi<'Line'>>>(new Map());
   const subPaneRefs = useRef<Map<string, ISeriesApi<'Line' | 'Histogram'>>>(
     new Map(),
@@ -89,6 +124,42 @@ export default function Chart({
       },
     });
 
+    // Zone backdrop area series. Added BEFORE the candle series so they
+    // render behind the bars rather than on top of them. Both live on an
+    // invisible price scale; feeding both 0 and 1 values lets the
+    // auto-scale fit to [0, 1], so a value=1 area fills the full chart
+    // height and a value=0 area collapses to nothing — giving us crisp,
+    // single-candle-wide on/off bands. `LastPriceAnimation.Disabled` plus
+    // the no-line/no-crosshair flags keep the overlay invisible-except-fill.
+    const longZoneSeries = chart.addAreaSeries({
+      priceScaleId: 'zones-overlay',
+      topColor: 'rgba(38, 166, 154, 0.24)',
+      bottomColor: 'rgba(38, 166, 154, 0.08)',
+      lineColor: 'rgba(0,0,0,0)',
+      lineWidth: 1,
+      lineType: LineType.WithSteps,
+      priceLineVisible: false,
+      lastValueVisible: false,
+      crosshairMarkerVisible: false,
+      baseLineVisible: false,
+    });
+    const flatZoneSeries = chart.addAreaSeries({
+      priceScaleId: 'zones-overlay',
+      topColor: 'rgba(239, 83, 80, 0.24)',
+      bottomColor: 'rgba(239, 83, 80, 0.08)',
+      lineColor: 'rgba(0,0,0,0)',
+      lineWidth: 1,
+      lineType: LineType.WithSteps,
+      priceLineVisible: false,
+      lastValueVisible: false,
+      crosshairMarkerVisible: false,
+      baseLineVisible: false,
+    });
+    chart.priceScale('zones-overlay').applyOptions({
+      visible: false,
+      scaleMargins: { top: 0, bottom: 0 },
+    });
+
     const candleSeries = chart.addCandlestickSeries({
       upColor: UP,
       downColor: DOWN,
@@ -117,6 +188,8 @@ export default function Chart({
     chartRef.current = chart;
     candleSeriesRef.current = candleSeries;
     volumeSeriesRef.current = volumeSeries;
+    longZoneRef.current = longZoneSeries;
+    flatZoneRef.current = flatZoneSeries;
 
     const ro = new ResizeObserver(() => {
       if (chartRef.current && container) {
@@ -138,10 +211,64 @@ export default function Chart({
       chartRef.current = null;
       candleSeriesRef.current = null;
       volumeSeriesRef.current = null;
+      longZoneRef.current = null;
+      flatZoneRef.current = null;
       overlayMap.clear();
       subPaneMap.clear();
     };
   }, []);
+
+  // Push the per-symbol price precision through to the candle series so the
+  // right-axis labels, crosshair tooltip, and last-price line all render
+  // with the right number of decimals. Without this, lightweight-charts
+  // defaults to 2 decimals and dust-priced coins clip to "0.00".
+  useEffect(() => {
+    const series = candleSeriesRef.current;
+    if (!series) return;
+    if (pricePrecision === undefined) return;
+    const minMove =
+      pricePrecisionTickSize && pricePrecisionTickSize > 0
+        ? pricePrecisionTickSize
+        : Math.pow(10, -pricePrecision);
+    series.applyOptions({
+      priceFormat: {
+        type: 'price',
+        precision: pricePrecision,
+        minMove,
+      },
+    });
+  }, [pricePrecision, pricePrecisionTickSize]);
+
+  // Position-zone shading. Each candle emits an explicit numeric value
+  // (1 = band visible, 0 = band invisible) on both series. Using 0 instead
+  // of whitespace anchors the price scale's auto-fit to the [0, 1] range,
+  // which is what makes value=1 actually fill the chart height; with
+  // whitespace-only off points the scale collapses to [1, 1] and the bands
+  // were rendered as a thin nondescript strip — that's the "gray area" you
+  // were seeing. Step-line interpolation gives sharp vertical boundaries
+  // at the signal candle rather than diagonal ramps.
+  useEffect(() => {
+    const longSeries = longZoneRef.current;
+    const flatSeries = flatZoneRef.current;
+    if (!longSeries || !flatSeries) return;
+
+    if (!zones || zones.length === 0) {
+      longSeries.setData([]);
+      flatSeries.setData([]);
+      return;
+    }
+
+    const longData = zones.map((z) => ({
+      time: z.time as UTCTimestamp,
+      value: z.state === 'long' ? 1 : 0,
+    }));
+    const flatData = zones.map((z) => ({
+      time: z.time as UTCTimestamp,
+      value: z.state === 'flat' ? 1 : 0,
+    }));
+    longSeries.setData(longData);
+    flatSeries.setData(flatData);
+  }, [zones]);
 
   // Update OHLCV data. We always replace the underlying series data (cheap
   // diff inside lightweight-charts) so indicators stay aligned, but we only
@@ -343,15 +470,17 @@ export default function Chart({
     }
   }, [indicators, indicatorValues, data]);
 
-  // Trade markers
+  // Trade + signal markers. lightweight-charts accepts only one marker array
+  // per series, so we merge both sources here. Markers must be sorted by time.
+  //
+  //   • Backtest trades (from `trades`) → big arrows + price/PnL text label.
+  //   • Indicator signals (from `signals`) → small green/red circles, no text,
+  //     so the visual stays clean even when there are many per chart.
   useEffect(() => {
     const series = candleSeriesRef.current;
     if (!series) return;
-    if (!trades || trades.length === 0) {
-      series.setMarkers([]);
-      return;
-    }
-    const markers: SeriesMarker<Time>[] = trades.map((t) => ({
+
+    const tradeMarkers: SeriesMarker<Time>[] = (trades ?? []).map((t) => ({
       time: t.time as UTCTimestamp,
       position: t.type === 'BUY' ? 'belowBar' : 'aboveBar',
       color: t.type === 'BUY' ? UP : DOWN,
@@ -365,8 +494,26 @@ export default function Chart({
                 : ''
             }`,
     }));
-    series.setMarkers(markers);
-  }, [trades]);
+
+    const signalMarkers: SeriesMarker<Time>[] = (signals ?? []).map((s) => ({
+      time: s.time as UTCTimestamp,
+      position: s.type === 'BUY' ? 'belowBar' : 'aboveBar',
+      color: s.type === 'BUY' ? UP : DOWN,
+      shape: 'circle',
+      // `size` defaults to 1; lightweight-charts shrinks circles to fit within
+      // a single bar's width without extra config.
+    }));
+
+    if (tradeMarkers.length === 0 && signalMarkers.length === 0) {
+      series.setMarkers([]);
+      return;
+    }
+
+    const merged = [...tradeMarkers, ...signalMarkers].sort(
+      (a, b) => Number(a.time) - Number(b.time),
+    );
+    series.setMarkers(merged);
+  }, [trades, signals]);
 
   return <div ref={containerRef} className="h-full w-full" />;
 }

@@ -144,6 +144,45 @@ export function symbolDisplayName(symbol: string): string {
   return symbol;
 }
 
+/**
+ * Reasonable precision fallback when an explicit per-symbol value isn't
+ * available (e.g. Yahoo Finance tickers, or a Binance symbol whose info
+ * hasn't loaded yet). For very small prices we use a magnitude-based
+ * fallback so dust-priced coins don't display as "0.00".
+ */
+export function precisionFallback(symbol: string, price: number): number {
+  if (symbol.endsWith('=F')) return 4; // commodity futures: penny-fraction ticks
+  if (COMMODITY_NAMES[symbol]) return 4;
+  if (!symbol.endsWith('USDT')) return 2; // most US equities
+  // Crypto fallback by magnitude when tick info isn't loaded yet.
+  if (!Number.isFinite(price)) return 4;
+  if (price >= 1000) return 2;
+  if (price >= 1) return 4;
+  if (price >= 0.01) return 5;
+  if (price >= 0.0001) return 6;
+  return 8;
+}
+
+/**
+ * Formats a price for display using an explicit precision when known
+ * (typically pulled from Binance's `tickSize`) and a magnitude-based
+ * fallback when not. Always uses thousands separators above 1k.
+ */
+export function formatPrice(
+  price: number,
+  symbol: string,
+  precisions: Record<string, number> = {},
+): string {
+  if (!Number.isFinite(price)) return '—';
+  const explicit = precisions[symbol];
+  const decimals =
+    typeof explicit === 'number' ? explicit : precisionFallback(symbol, price);
+  return price.toLocaleString('en-US', {
+    minimumFractionDigits: decimals,
+    maximumFractionDigits: decimals,
+  });
+}
+
 /* -------------------------------------------------------------------------- */
 /*                              Yahoo client                                  */
 /* -------------------------------------------------------------------------- */

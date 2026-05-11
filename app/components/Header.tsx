@@ -2,6 +2,7 @@
 
 import { Menu, Bell, Settings, LineChart, X } from './icons';
 import { useAppStore, POPULAR_SYMBOLS } from '../store/store';
+import { formatPrice } from '../lib/marketData';
 import { TIMEFRAMES, type Timeframe } from '../lib/types';
 
 interface Props {
@@ -18,6 +19,7 @@ export default function Header({ onOpenAlerts, onOpenSettings }: Props) {
   const allSymbols = useAppStore((s) => s.allSymbols);
   const stockSymbols = useAppStore((s) => s.stockSymbols);
   const commoditySymbols = useAppStore((s) => s.commoditySymbols);
+  const symbolPrecisions = useAppStore((s) => s.symbolPrecisions);
   const lastPrice = useAppStore((s) => s.lastPrice);
   const priceChange24h = useAppStore((s) => s.priceChange24h);
   const unreadNotifications = useAppStore((s) => s.unreadNotifications);
@@ -90,7 +92,7 @@ export default function Header({ onOpenAlerts, onOpenSettings }: Props) {
         {lastPrice !== null && (
           <div className="hidden sm:flex items-baseline gap-2">
             <span className="font-mono font-semibold tabular-nums">
-              ${formatPrice(lastPrice)}
+              ${formatPrice(lastPrice, selectedSymbol, symbolPrecisions)}
             </span>
             {priceChange24h !== null && (
               <span
@@ -156,9 +158,3 @@ export default function Header({ onOpenAlerts, onOpenSettings }: Props) {
   );
 }
 
-function formatPrice(p: number): string {
-  if (p >= 1000) return p.toLocaleString('en-US', { maximumFractionDigits: 2 });
-  if (p >= 1) return p.toFixed(2);
-  if (p >= 0.01) return p.toFixed(4);
-  return p.toFixed(6);
-}

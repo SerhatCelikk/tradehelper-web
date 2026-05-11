@@ -6,7 +6,11 @@ import {
   type MarketCategory,
   type SymbolStat,
 } from '../store/store';
-import { COMMODITY_NAMES, classifySymbol } from '../lib/marketData';
+import {
+  COMMODITY_NAMES,
+  classifySymbol,
+  formatPrice,
+} from '../lib/marketData';
 import {
   ChevronDown,
   ChevronRight,
@@ -29,6 +33,7 @@ export default function WatchlistPanel({ onSelect }: Props) {
   const stockSymbols = useAppStore((s) => s.stockSymbols);
   const commoditySymbols = useAppStore((s) => s.commoditySymbols);
   const symbolStats = useAppStore((s) => s.symbolStats);
+  const symbolPrecisions = useAppStore((s) => s.symbolPrecisions);
   const isSymbolsLoading = useAppStore((s) => s.isSymbolsLoading);
   const symbolsError = useAppStore((s) => s.symbolsError);
   const collapsedSections = useAppStore((s) => s.collapsedSections);
@@ -123,6 +128,7 @@ export default function WatchlistPanel({ onSelect }: Props) {
                   key={sym}
                   symbol={sym}
                   stat={symbolStats[sym]}
+                  precision={symbolPrecisions[sym]}
                   isFavorite
                   isSelected={sym === selectedSymbol}
                   onSelect={() => handlePick(sym)}
@@ -155,6 +161,7 @@ export default function WatchlistPanel({ onSelect }: Props) {
             <PaginatedList
               symbols={cryptoList}
               symbolStats={symbolStats}
+              symbolPrecisions={symbolPrecisions}
               favoriteSet={favoriteSet}
               selectedSymbol={selectedSymbol}
               onSelect={handlePick}
@@ -181,6 +188,7 @@ export default function WatchlistPanel({ onSelect }: Props) {
             <PaginatedList
               symbols={stockList}
               symbolStats={symbolStats}
+              symbolPrecisions={symbolPrecisions}
               favoriteSet={favoriteSet}
               selectedSymbol={selectedSymbol}
               onSelect={handlePick}
@@ -207,6 +215,7 @@ export default function WatchlistPanel({ onSelect }: Props) {
             <PaginatedList
               symbols={commodityList}
               symbolStats={symbolStats}
+              symbolPrecisions={symbolPrecisions}
               favoriteSet={favoriteSet}
               selectedSymbol={selectedSymbol}
               onSelect={handlePick}
@@ -287,6 +296,7 @@ const PAGE_STEP = 80;
 interface PaginatedListProps {
   symbols: string[];
   symbolStats: Record<string, SymbolStat>;
+  symbolPrecisions: Record<string, number>;
   favoriteSet: Set<string>;
   selectedSymbol: string;
   onSelect: (sym: string) => void;
@@ -297,6 +307,7 @@ interface PaginatedListProps {
 function PaginatedList({
   symbols,
   symbolStats,
+  symbolPrecisions,
   favoriteSet,
   selectedSymbol,
   onSelect,
@@ -321,6 +332,7 @@ function PaginatedList({
             key={sym}
             symbol={sym}
             stat={symbolStats[sym]}
+            precision={symbolPrecisions[sym]}
             isFavorite={favoriteSet.has(sym)}
             isSelected={sym === selectedSymbol}
             onSelect={() => onSelect(sym)}
@@ -348,6 +360,7 @@ function PaginatedList({
 interface SymbolRowProps {
   symbol: string;
   stat: SymbolStat | undefined;
+  precision: number | undefined;
   isFavorite: boolean;
   isSelected: boolean;
   onSelect: () => void;
@@ -357,6 +370,7 @@ interface SymbolRowProps {
 function SymbolRow({
   symbol,
   stat,
+  precision,
   isFavorite,
   isSelected,
   onSelect,
@@ -382,7 +396,13 @@ function SymbolRow({
           <div className="font-medium text-sm truncate">{display}</div>
           <div className="text-xs text-foreground-muted font-mono mt-0.5 tabular-nums truncate">
             {subline ? `${subline} · ` : ''}
-            {stat ? `$${formatPrice(stat.price)}` : '—'}
+            {stat
+              ? `$${formatPrice(
+                  stat.price,
+                  symbol,
+                  precision !== undefined ? { [symbol]: precision } : {},
+                )}`
+              : '—'}
           </div>
         </button>
 
@@ -446,14 +466,6 @@ function displaySymbol(sym: string): string {
 function subSymbol(sym: string): string {
   if (COMMODITY_NAMES[sym]) return sym;
   return '';
-}
-
-function formatPrice(p: number): string {
-  if (!Number.isFinite(p)) return '—';
-  if (p >= 1000) return p.toLocaleString('en-US', { maximumFractionDigits: 2 });
-  if (p >= 1) return p.toFixed(2);
-  if (p >= 0.01) return p.toFixed(4);
-  return p.toFixed(6);
 }
 
 // Re-export for callers that need it without re-importing from marketData

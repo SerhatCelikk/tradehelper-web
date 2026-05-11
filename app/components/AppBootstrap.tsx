@@ -26,6 +26,7 @@ export default function AppBootstrap() {
   const setCommoditySymbols = useAppStore((s) => s.setCommoditySymbols);
   const setSymbolStats = useAppStore((s) => s.setSymbolStats);
   const mergeSymbolStats = useAppStore((s) => s.mergeSymbolStats);
+  const setSymbolPrecisions = useAppStore((s) => s.setSymbolPrecisions);
   const setSymbolsLoading = useAppStore((s) => s.setSymbolsLoading);
   const setSymbolsError = useAppStore((s) => s.setSymbolsError);
 
@@ -90,6 +91,10 @@ export default function AppBootstrap() {
           };
         }
 
+        // Per-symbol price precision from each pair's PRICE_FILTER tickSize.
+        const precisions: Record<string, number> = {};
+        for (const s of info) precisions[s.symbol] = s.pricePrecision;
+
         // Sort by 24h quote volume so popular pairs surface first.
         const sortedSymbols = Array.from(validSet).sort((a, b) => {
           const va = stats[a]?.volume ?? 0;
@@ -99,6 +104,7 @@ export default function AppBootstrap() {
 
         setAllSymbols(sortedSymbols);
         setSymbolStats(stats);
+        setSymbolPrecisions(precisions);
         setSymbolsLoading(false);
       } catch (err) {
         if (cancelled) return;
@@ -170,6 +176,7 @@ export default function AppBootstrap() {
     setCommoditySymbols,
     setSymbolStats,
     mergeSymbolStats,
+    setSymbolPrecisions,
     setSymbolsLoading,
     setSymbolsError,
   ]);

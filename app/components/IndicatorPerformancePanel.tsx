@@ -29,6 +29,8 @@ export default function IndicatorPerformancePanel() {
   const indicators = useAppStore((s) => s.indicators);
   const symbol = useAppStore((s) => s.selectedSymbol);
   const setIndicators = useAppStore((s) => s.setIndicators);
+  const focusedIndicatorId = useAppStore((s) => s.focusedIndicatorId);
+  const setFocusedIndicator = useAppStore((s) => s.setFocusedIndicator);
 
   const {
     data,
@@ -67,6 +69,19 @@ export default function IndicatorPerformancePanel() {
         i.id === id ? { ...i, enabled: !i.enabled } : i,
       ),
     );
+  };
+
+  // Focus toggle: clicking it on an indicator makes that one the sole signal
+  // source on the chart and paints the long/flat position zones behind the
+  // candles. Signals are computed on the indicator's own timeframe (e.g. 4h
+  // RSI) and mapped onto whatever timeframe the chart is displaying — the
+  // chart's own line overlays still follow the chart's timeframe.
+  const handleToggleFocus = (id: string) => {
+    if (focusedIndicatorId === id) {
+      setFocusedIndicator(null);
+      return;
+    }
+    setFocusedIndicator(id);
   };
 
   return (
@@ -132,10 +147,12 @@ export default function IndicatorPerformancePanel() {
             error={errorFor(ind)}
             yearlyLoading={isYearlyLoading(ind)}
             yearlyError={yearlyErrorFor(ind)}
+            isFocused={focusedIndicatorId === ind.id}
             onRunYearly={() => runYearly(ind.id)}
             onOpenSettings={() => setEditingId(ind.id)}
             onReset={() => handleResetCard(ind.id)}
             onToggleOverlay={() => handleToggleOverlay(ind.id)}
+            onToggleFocus={() => handleToggleFocus(ind.id)}
             onRetry={retry}
           />
         ))}
@@ -159,10 +176,12 @@ interface CardProps {
   error: string | null;
   yearlyLoading: boolean;
   yearlyError: string | null;
+  isFocused: boolean;
   onRunYearly: () => void;
   onOpenSettings: () => void;
   onReset: () => void;
   onToggleOverlay: () => void;
+  onToggleFocus: () => void;
   onRetry: () => void;
 }
 
@@ -173,10 +192,12 @@ function IndicatorCard({
   error,
   yearlyLoading,
   yearlyError,
+  isFocused,
   onRunYearly,
   onOpenSettings,
   onReset,
   onToggleOverlay,
+  onToggleFocus,
   onRetry,
 }: CardProps) {
   const headerLine = formatHeader(indicator);
@@ -186,11 +207,13 @@ function IndicatorCard({
   return (
     <article
       className={`rounded-lg border bg-background-tertiary overflow-hidden transition-colors ${
-        loading
-          ? 'border-accent/40'
-          : error
-            ? 'border-danger/40'
-            : 'border-border'
+        isFocused
+          ? 'border-accent ring-1 ring-accent/40'
+          : loading
+            ? 'border-accent/40'
+            : error
+              ? 'border-danger/40'
+              : 'border-border'
       }`}
     >
       {/* Top progress bar when loading */}
@@ -235,6 +258,23 @@ function IndicatorCard({
             />
             chart
           </label>
+          <button
+            type="button"
+            onClick={onToggleFocus}
+            className={`text-[10px] px-1.5 py-1 rounded transition-colors ${
+              isFocused
+                ? 'bg-accent text-white'
+                : 'text-foreground-muted hover:bg-background-elevated'
+            }`}
+            title={
+              isFocused
+                ? 'Stop isolating this indicator on the chart'
+                : `Isolate this indicator: only its buy/sell signals show on the chart, with long/flat zones shaded. Signals come from ${indicator.timeframe} data regardless of the chart's current timeframe.`
+            }
+            aria-pressed={isFocused}
+          >
+            focus
+          </button>
           <button
             className="btn-ghost p-1.5 text-foreground-muted"
             onClick={onReset}

@@ -114,11 +114,23 @@ interface AppState {
   commoditySymbols: string[];
   // Unified price/change map keyed by ticker, regardless of asset class
   symbolStats: Record<string, SymbolStat>;
+  /**
+   * Per-symbol price-display precision. For Binance pairs this is derived
+   * from the exchange's `PRICE_FILTER.tickSize`; for Yahoo-backed tickers we
+   * fall back to a sensible per-asset-class default. Missing entries mean
+   * "use the magnitude-based fallback in `formatPrice`".
+   */
+  symbolPrecisions: Record<string, number>;
   isSymbolsLoading: boolean;
   symbolsError: string | null;
 
   // UI: which market-category sections are collapsed in the side panel
   collapsedSections: Record<MarketCategory, boolean>;
+
+  // Single indicator to isolate on the chart — when set, its buy/sell signals
+  // are the only ones drawn, and the in-position vs flat-position zones are
+  // shaded behind the candles.
+  focusedIndicatorId: string | null;
 
   // Market data
   candleData: Candle[];
@@ -162,9 +174,12 @@ interface AppState {
   setCommoditySymbols: (s: string[]) => void;
   setSymbolStats: (s: Record<string, SymbolStat>) => void;
   mergeSymbolStats: (s: Record<string, SymbolStat>) => void;
+  setSymbolPrecisions: (s: Record<string, number>) => void;
+  mergeSymbolPrecisions: (s: Record<string, number>) => void;
   setSymbolsLoading: (b: boolean) => void;
   setSymbolsError: (e: string | null) => void;
   toggleSection: (key: MarketCategory) => void;
+  setFocusedIndicator: (id: string | null) => void;
 
   setCandleData: (c: Candle[]) => void;
   appendCandle: (c: Candle) => void;
@@ -242,10 +257,12 @@ export const useAppStore = create<AppState>((set, get) => ({
   stockSymbols: [],
   commoditySymbols: [],
   symbolStats: {},
+  symbolPrecisions: {},
   isSymbolsLoading: false,
   symbolsError: null,
 
   collapsedSections: { ...DEFAULT_COLLAPSED },
+  focusedIndicatorId: null,
 
   candleData: [],
   lastPrice: null,
@@ -307,6 +324,9 @@ export const useAppStore = create<AppState>((set, get) => ({
   setSymbolStats: (s) => set({ symbolStats: s }),
   mergeSymbolStats: (s) =>
     set({ symbolStats: { ...get().symbolStats, ...s } }),
+  setSymbolPrecisions: (s) => set({ symbolPrecisions: s }),
+  mergeSymbolPrecisions: (s) =>
+    set({ symbolPrecisions: { ...get().symbolPrecisions, ...s } }),
   setSymbolsLoading: (b) => set({ isSymbolsLoading: b }),
   setSymbolsError: (e) => set({ symbolsError: e }),
   toggleSection: (key) => {
@@ -317,6 +337,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({ collapsedSections: next });
     savePersisted(persistKeys.collapsedSections, next);
   },
+  setFocusedIndicator: (id) => set({ focusedIndicatorId: id }),
 
   setCandleData: (c) => set({ candleData: c }),
   appendCandle: (c) => {

@@ -199,3 +199,30 @@ export interface BacktestSettings {
   initialCapital: number;
   commission: number;
 }
+
+/**
+ * A single buy/sell point produced by an indicator's rules. Lightweight
+ * version of `Trade` — no quantity or PnL because there's no portfolio being
+ * simulated; just the moment the strategy condition flipped.
+ */
+export interface ChartSignal {
+  time: number;
+  type: 'BUY' | 'SELL';
+  /**
+   * The indicator that produced this signal (e.g. 'RSI', 'MACD'). When
+   * multiple indicators emit a signal at the same time/type we collect their
+   * labels for display in a single marker.
+   */
+  source: IndicatorType;
+}
+
+/**
+ * Per-candle position state produced from a sequence of buy/sell signals.
+ * Used to paint translucent green ("long") and red ("flat") background
+ * bands behind the candles in focused-indicator mode.
+ */
+export type PositionState = 'long' | 'flat';
+export interface CandlePosition {
+  time: number;
+  state: PositionState;
+}

@@ -306,6 +306,22 @@ export interface SymbolInfo {
   symbol: string;
   baseAsset: string;
   quoteAsset: string;
+  /** Number of decimal places implied by the symbol's PRICE_FILTER tickSize. */
+  pricePrecision: number;
+  /** Raw tick size as a number (e.g. 0.01). */
+  tickSize: number;
+}
+
+/**
+ * Derives the number of decimal places from a Binance tickSize string. For a
+ * tickSize of "0.00001000" we want precision 5, for "0.01000000" we want 2,
+ * for "1.00000000" we want 0. Using log10 keeps this robust against trailing
+ * zeros and unusual sub-tenth ticks like "0.5" → precision 1.
+ */
+export function precisionFromTickSize(tickSize: string): number {
+  const n = parseFloat(tickSize);
+  if (!Number.isFinite(n) || n <= 0) return 8;
+  return Math.max(0, -Math.floor(Math.log10(n)));
 }
 
 /** All TRADING-status symbols whose quote asset is USDT, with base-asset info. */
@@ -318,13 +334,22 @@ export async function fetchUsdtSymbolsInfo(): Promise<SymbolInfo[]> {
     status: string;
     quoteAsset: string;
     baseAsset: string;
+    filters?: Array<{ filterType: string; tickSize?: string }>;
   }>)
     .filter((s) => s.status === 'TRADING' && s.quoteAsset === 'USDT')
-    .map((s) => ({
-      symbol: s.symbol,
-      baseAsset: s.baseAsset,
-      quoteAsset: s.quoteAsset,
-    }));
+    .map((s) => {
+      const priceFilter = s.filters?.find((f) => f.filterType === 'PRICE_FILTER');
+      const tickStr = priceFilter?.tickSize ?? '0.01';
+      const tickSize = parseFloat(tickStr);
+      const pricePrecision = precisionFromTickSize(tickStr);
+      return {
+        symbol: s.symbol,
+        baseAsset: s.baseAsset,
+        quoteAsset: s.quoteAsset,
+        pricePrecision,
+        tickSize: Number.isFinite(tickSize) && tickSize > 0 ? tickSize : 0.01,
+      };
+    });
 }
 
 /**

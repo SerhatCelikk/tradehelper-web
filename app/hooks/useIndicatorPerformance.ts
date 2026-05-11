@@ -2,7 +2,10 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useAppStore } from '../store/store';
-import { fetchKlinesForRange } from '../lib/marketData';
+import {
+  getCachedKlines,
+  invalidateKlinesCache as invalidateShared,
+} from '../lib/klinesCache';
 import { runBacktest } from '../lib/backtest';
 import { defaultStrategyFor } from '../lib/indicatorStrategies';
 import type {
@@ -14,7 +17,6 @@ import type {
 
 const DAY = 86_400_000;
 
-const AUTO_RANGE_MS = 31 * DAY; // covers daily/weekly/monthly with margin
 const YEARLY_RANGE_MS = 365 * DAY;
 
 const RANGES = {
@@ -23,6 +25,35 @@ const RANGES = {
   monthly: 30 * DAY,
   yearly: 365 * DAY,
 } as const;
+
+const TIMEFRAME_MS_LOCAL: Record<Timeframe, number> = {
+  '1m': 60_000,
+  '5m': 5 * 60_000,
+  '15m': 15 * 60_000,
+  '30m': 30 * 60_000,
+  '1h': 60 * 60_000,
+  '4h': 4 * 60 * 60_000,
+  '1d': 24 * 60 * 60_000,
+  '1w': 7 * 24 * 60 * 60_000,
+};
+
+/**
+ * Fetch enough history so the strategy's long/flat state machine can evolve
+ * naturally from far before the displayed range. Otherwise an indicator that
+ * bought months ago and never sold would still appear to make "fresh" round
+ * trips in the Weekly/Monthly window because the state was artificially
+ * reset to flat at the window start — which is what was producing the
+ * "Weekly: 4 trades" vs "chart has been green since November" mismatch.
+ *
+ * We target ~500 candles at the indicator's own timeframe (matches the
+ * chart's `limit: 500` fetch) with a floor of 31 days and a ceiling of
+ * 730 days (Yahoo's per-interval cap for sub-daily data).
+ */
+function autoRangeFor(tf: Timeframe): number {
+  const tfMs = TIMEFRAME_MS_LOCAL[tf] ?? TIMEFRAME_MS_LOCAL['4h'];
+  const target = 500 * tfMs;
+  return Math.min(730 * DAY, Math.max(31 * DAY, target));
+}
 
 export type RangeKey = keyof typeof RANGES;
 
@@ -41,61 +72,6 @@ export interface IndicatorPerformance {
   candleCount: number;
   startTime: number | null;
   endTime: number | null;
-}
-
-/* -------------------------------------------------------------------------- */
-/*                Module-scope cache: one fetch per (symbol|tf)               */
-/* -------------------------------------------------------------------------- */
-
-interface CacheEntry {
-  candles: Candle[];
-  fetchedAt: number;
-  /**
-   * The maximum range that was *requested* for this entry. Future requests
-   * for the same or smaller range get a cache hit even if the actual
-   * coverage is shorter (because we couldn't fetch more — saturation).
-   */
-  requestedRangeMs: number;
-}
-
-const CACHE_TTL = 60_000;
-const klinesCache = new Map<string, CacheEntry>();
-const inFlight = new Map<string, Promise<Candle[]>>();
-
-async function getKlines(
-  symbol: string,
-  timeframe: Timeframe,
-  rangeMs: number,
-  cryptoUniverse: ReadonlySet<string>,
-): Promise<Candle[]> {
-  const key = `${symbol}|${timeframe}`;
-  const cached = klinesCache.get(key);
-  if (
-    cached &&
-    Date.now() - cached.fetchedAt < CACHE_TTL &&
-    cached.requestedRangeMs >= rangeMs
-  ) {
-    return cached.candles;
-  }
-
-  const inFlightKey = `${key}|${rangeMs}`;
-  const existing = inFlight.get(inFlightKey);
-  if (existing) return existing;
-
-  const promise = fetchKlinesForRange(symbol, timeframe, rangeMs, cryptoUniverse)
-    .then((candles) => {
-      klinesCache.set(key, {
-        candles,
-        fetchedAt: Date.now(),
-        requestedRangeMs: rangeMs,
-      });
-      return candles;
-    })
-    .finally(() => {
-      inFlight.delete(inFlightKey);
-    });
-  inFlight.set(inFlightKey, promise);
-  return promise;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -176,7 +152,7 @@ export function useIndicatorPerformance(
     for (const tf of uniqueTfs) {
       (async () => {
         try {
-          const candles = await getKlines(symbol, tf, AUTO_RANGE_MS, cryptoUniverse);
+          const candles = await getCachedKlines(symbol, tf, autoRangeFor(tf), cryptoUniverse);
           if (cancelled) return;
           // Update auto data for indicators on this timeframe
           setAutoData((prev) => {
@@ -229,7 +205,7 @@ export function useIndicatorPerformance(
       });
 
       try {
-        const candles = await getKlines(symbol, tf, YEARLY_RANGE_MS, cryptoUniverse);
+        const candles = await getCachedKlines(symbol, tf, YEARLY_RANGE_MS, cryptoUniverse);
         const matched = indicators.filter((i) => i.timeframe === tf);
         setYearlyData((prev) => {
           const next = new Map(prev);
@@ -254,7 +230,7 @@ export function useIndicatorPerformance(
   );
 
   const retry = useCallback(() => {
-    invalidateKlinesCache(symbol);
+    invalidateShared(symbol);
     setRefreshKey((k) => k + 1);
     setYearlyData(new Map());
     setYearlyLoadingTfs(new Set());
@@ -370,23 +346,25 @@ function computeRange(
   const lastMs = lastSec * 1000;
   const startMs = lastMs - rangeMs;
   const startSec = Math.floor(startMs / 1000);
-  const minCandlesNeeded = warmupCandles(ind);
-  const idxStart = Math.max(0, indexFor(candles, startSec) - minCandlesNeeded);
-  const slice = candles.slice(idxStart);
-  const evalStart = indexFor(slice, startSec);
+  const evalStart = indexFor(candles, startSec);
 
-  if (slice.length - evalStart < 5) return emptyStat();
+  if (candles.length - evalStart < 5) return emptyStat();
 
   const strategy = defaultStrategyFor(ind);
   try {
-    const result = runBacktest(slice, strategy, {
+    // Backtest over the *whole* candle history so the long/flat state at the
+    // window's left edge reflects what really happened, not an artificial
+    // flat reset. Trades are then filtered to the requested range for
+    // display. This keeps the Weekly/Monthly counts here aligned with the
+    // markers visible on the chart.
+    const result = runBacktest(candles, strategy, {
       symbol: ind.id,
       timeframe: ind.timeframe,
       initialCapital: 10_000,
       commission: 0.001,
     });
     return {
-      ...filterToRange(result, slice[evalStart].time),
+      ...filterToRange(result, candles[evalStart].time),
       available: true,
     };
   } catch (err) {
@@ -406,22 +384,6 @@ function indexFor(candles: Candle[], targetSec: number): number {
     else hi = mid;
   }
   return lo;
-}
-
-function warmupCandles(ind: IndicatorConfig): number {
-  switch (ind.type) {
-    case 'RSI':
-      return (ind.params.period ?? 14) + 5;
-    case 'MACD':
-      return (
-        (ind.params.slowPeriod ?? 26) + (ind.params.signalPeriod ?? 9) + 5
-      );
-    case 'BBANDS':
-      return (ind.params.period ?? 20) + 5;
-    case 'SMA':
-    case 'EMA':
-      return (ind.params.period ?? 20) + 5;
-  }
 }
 
 interface RangeAggregate {
@@ -458,13 +420,4 @@ function filterToRange(
   };
 }
 
-/** Manually invalidate the kline cache (e.g. after symbol change). */
-export function invalidateKlinesCache(symbol?: string) {
-  if (!symbol) {
-    klinesCache.clear();
-    return;
-  }
-  for (const k of Array.from(klinesCache.keys())) {
-    if (k.startsWith(`${symbol}|`)) klinesCache.delete(k);
-  }
-}
+export { invalidateKlinesCache } from '../lib/klinesCache';
