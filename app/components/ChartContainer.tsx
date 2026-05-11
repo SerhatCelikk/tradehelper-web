@@ -13,6 +13,8 @@ export default function ChartContainer({ indicatorValues }: Props) {
   const indicators = useAppStore((s) => s.indicators);
   const lastBacktest = useAppStore((s) => s.lastBacktest);
   const isLoadingHistory = useAppStore((s) => s.isLoadingHistory);
+  const selectedSymbol = useAppStore((s) => s.selectedSymbol);
+  const timeframe = useAppStore((s) => s.timeframe);
 
   if (isLoadingHistory && candleData.length === 0) {
     return (
@@ -32,6 +34,7 @@ export default function ChartContainer({ indicatorValues }: Props) {
         indicators={indicators}
         indicatorValues={indicatorValues}
         trades={lastBacktest?.trades}
+        datasetKey={`${selectedSymbol}|${timeframe}`}
       />
     </div>
   );

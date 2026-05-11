@@ -93,11 +93,32 @@ export function defaultConfigForType(type: IndicatorConfig['type']): IndicatorCo
   return JSON.parse(JSON.stringify(base)) as IndicatorConfig;
 }
 
+export interface SymbolStat {
+  price: number;
+  change: number;
+  volume: number;
+}
+
+export type MarketCategory = 'favorites' | 'crypto' | 'stocks' | 'commodities';
+
 interface AppState {
   // Symbol & timeframe
   selectedSymbol: string;
   timeframe: Timeframe;
   watchlist: string[];
+
+  // Universe: all USDT trading pairs from Binance
+  allSymbols: string[];
+  // Curated Yahoo-Finance backed universes
+  stockSymbols: string[];
+  commoditySymbols: string[];
+  // Unified price/change map keyed by ticker, regardless of asset class
+  symbolStats: Record<string, SymbolStat>;
+  isSymbolsLoading: boolean;
+  symbolsError: string | null;
+
+  // UI: which market-category sections are collapsed in the side panel
+  collapsedSections: Record<MarketCategory, boolean>;
 
   // Market data
   candleData: Candle[];
@@ -133,7 +154,17 @@ interface AppState {
   setTimeframe: (t: Timeframe) => void;
   addToWatchlist: (s: string) => void;
   removeFromWatchlist: (s: string) => void;
+  toggleFavorite: (s: string) => void;
   setWatchlist: (list: string[]) => void;
+
+  setAllSymbols: (s: string[]) => void;
+  setStockSymbols: (s: string[]) => void;
+  setCommoditySymbols: (s: string[]) => void;
+  setSymbolStats: (s: Record<string, SymbolStat>) => void;
+  mergeSymbolStats: (s: Record<string, SymbolStat>) => void;
+  setSymbolsLoading: (b: boolean) => void;
+  setSymbolsError: (e: string | null) => void;
+  toggleSection: (key: MarketCategory) => void;
 
   setCandleData: (c: Candle[]) => void;
   appendCandle: (c: Candle) => void;
@@ -172,6 +203,14 @@ const persistKeys = {
   symbol: 'th_symbol',
   timeframe: 'th_timeframe',
   indicators: 'th_indicators',
+  collapsedSections: 'th_sections_collapsed',
+};
+
+const DEFAULT_COLLAPSED: Record<MarketCategory, boolean> = {
+  favorites: false,
+  crypto: false,
+  stocks: true,
+  commodities: true,
 };
 
 function loadPersisted<T>(key: string, fallback: T): T {
@@ -198,6 +237,15 @@ export const useAppStore = create<AppState>((set, get) => ({
   selectedSymbol: 'BTCUSDT',
   timeframe: '1h',
   watchlist: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'],
+
+  allSymbols: [],
+  stockSymbols: [],
+  commoditySymbols: [],
+  symbolStats: {},
+  isSymbolsLoading: false,
+  symbolsError: null,
+
+  collapsedSections: { ...DEFAULT_COLLAPSED },
 
   candleData: [],
   lastPrice: null,
@@ -240,9 +288,34 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({ watchlist: wl });
     savePersisted(persistKeys.watchlist, wl);
   },
+  toggleFavorite: (s) => {
+    const current = get().watchlist;
+    const wl = current.includes(s)
+      ? current.filter((x) => x !== s)
+      : Array.from(new Set([...current, s]));
+    set({ watchlist: wl });
+    savePersisted(persistKeys.watchlist, wl);
+  },
   setWatchlist: (list) => {
     set({ watchlist: list });
     savePersisted(persistKeys.watchlist, list);
+  },
+
+  setAllSymbols: (s) => set({ allSymbols: s }),
+  setStockSymbols: (s) => set({ stockSymbols: s }),
+  setCommoditySymbols: (s) => set({ commoditySymbols: s }),
+  setSymbolStats: (s) => set({ symbolStats: s }),
+  mergeSymbolStats: (s) =>
+    set({ symbolStats: { ...get().symbolStats, ...s } }),
+  setSymbolsLoading: (b) => set({ isSymbolsLoading: b }),
+  setSymbolsError: (e) => set({ symbolsError: e }),
+  toggleSection: (key) => {
+    const next = {
+      ...get().collapsedSections,
+      [key]: !get().collapsedSections[key],
+    };
+    set({ collapsedSections: next });
+    savePersisted(persistKeys.collapsedSections, next);
   },
 
   setCandleData: (c) => set({ candleData: c }),
@@ -359,6 +432,10 @@ export function hydrateStoreFromStorage() {
   const watchlist = loadPersisted<string[] | null>(persistKeys.watchlist, null);
   const indicatorsRaw = loadPersisted<unknown>(persistKeys.indicators, null);
   const indicators = migrateIndicators(indicatorsRaw);
+  const collapsed = loadPersisted<Partial<Record<MarketCategory, boolean>> | null>(
+    persistKeys.collapsedSections,
+    null,
+  );
 
   const state = useAppStore.getState();
   if (symbol) state.setSelectedSymbol(symbol);
@@ -367,5 +444,10 @@ export function hydrateStoreFromStorage() {
   if (indicators && indicators.length) {
     // setIndicators also re-persists, so old/partial saves get rewritten clean.
     state.setIndicators(indicators);
+  }
+  if (collapsed && typeof collapsed === 'object') {
+    useAppStore.setState({
+      collapsedSections: { ...DEFAULT_COLLAPSED, ...collapsed },
+    });
   }
 }

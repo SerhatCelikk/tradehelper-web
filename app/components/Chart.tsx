@@ -18,6 +18,13 @@ interface Props {
   indicators: IndicatorConfig[];
   indicatorValues: IndicatorValues;
   trades?: Trade[];
+  /**
+   * Identifier for the current dataset (typically `${symbol}|${timeframe}`).
+   * Used to decide when to auto-fit the visible range. While this key stays
+   * the same, incoming candles are treated as appends and the user's pan/zoom
+   * is preserved. When it changes, the view auto-fits the new dataset.
+   */
+  datasetKey?: string;
 }
 
 const CHART_BG = '#1E1E1E';
@@ -31,6 +38,7 @@ export default function Chart({
   indicators,
   indicatorValues,
   trades,
+  datasetKey,
 }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const chartRef = useRef<IChartApi | null>(null);
@@ -41,6 +49,7 @@ export default function Chart({
     new Map(),
   );
   const resizeObserverRef = useRef<ResizeObserver | null>(null);
+  const lastDatasetKeyRef = useRef<string | null>(null);
 
   // Init chart once
   useEffect(() => {
@@ -134,7 +143,11 @@ export default function Chart({
     };
   }, []);
 
-  // Update OHLCV data
+  // Update OHLCV data. We always replace the underlying series data (cheap
+  // diff inside lightweight-charts) so indicators stay aligned, but we only
+  // auto-fit the visible range when the *dataset identity* changes — i.e.
+  // when the symbol or timeframe switches. Real-time appends keep whatever
+  // pan/zoom the user has set.
   useEffect(() => {
     if (!candleSeriesRef.current || !volumeSeriesRef.current) return;
     const series = candleSeriesRef.current;
@@ -142,6 +155,7 @@ export default function Chart({
     if (!data || data.length === 0) {
       series.setData([]);
       volume.setData([]);
+      lastDatasetKeyRef.current = null;
       return;
     }
     series.setData(
@@ -160,8 +174,13 @@ export default function Chart({
         color: c.close >= c.open ? '#26A69A77' : '#EF535077',
       })),
     );
-    chartRef.current?.timeScale().fitContent();
-  }, [data]);
+
+    const key = datasetKey ?? 'default';
+    if (lastDatasetKeyRef.current !== key) {
+      chartRef.current?.timeScale().fitContent();
+      lastDatasetKeyRef.current = key;
+    }
+  }, [data, datasetKey]);
 
   // Manage overlays / sub-panes for indicators
   useEffect(() => {

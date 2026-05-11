@@ -1,7 +1,8 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { fetchKlinesRange } from '../lib/binance';
+import { useAppStore } from '../store/store';
+import { fetchKlinesForRange } from '../lib/marketData';
 import { runBacktest } from '../lib/backtest';
 import { defaultStrategyFor } from '../lib/indicatorStrategies';
 import type {
@@ -22,25 +23,6 @@ const RANGES = {
   monthly: 30 * DAY,
   yearly: 365 * DAY,
 } as const;
-
-/** Number of milliseconds per candle for each timeframe. */
-const TIMEFRAME_MS: Record<Timeframe, number> = {
-  '1m': 60_000,
-  '5m': 5 * 60_000,
-  '15m': 15 * 60_000,
-  '30m': 30 * 60_000,
-  '1h': 60 * 60_000,
-  '4h': 4 * 60 * 60_000,
-  '1d': 24 * 60 * 60_000,
-  '1w': 7 * 24 * 60 * 60_000,
-};
-
-/**
- * Hard cap to keep network usage reasonable. 50 iterations × 1000 candles
- * = 50k candles per timeframe — plenty for monthly even on 1m
- * (30 days × 24h × 60min ≈ 43k candles, fits in 44 iterations).
- */
-const MAX_ITERATIONS = 50;
 
 export type RangeKey = keyof typeof RANGES;
 
@@ -84,6 +66,7 @@ async function getKlines(
   symbol: string,
   timeframe: Timeframe,
   rangeMs: number,
+  cryptoUniverse: ReadonlySet<string>,
 ): Promise<Candle[]> {
   const key = `${symbol}|${timeframe}`;
   const cached = klinesCache.get(key);
@@ -99,18 +82,7 @@ async function getKlines(
   const existing = inFlight.get(inFlightKey);
   if (existing) return existing;
 
-  const end = Date.now();
-  const start = end - rangeMs;
-
-  // Iteration count scales with timeframe so 1m/5m actually cover the range.
-  const tfMs = TIMEFRAME_MS[timeframe] ?? TIMEFRAME_MS['4h'];
-  const candlesNeeded = Math.ceil(rangeMs / tfMs);
-  const itersNeeded = Math.ceil(candlesNeeded / 1000);
-  const maxIterations = Math.min(itersNeeded + 1, MAX_ITERATIONS);
-
-  const promise = fetchKlinesRange(symbol, timeframe, start, end, {
-    maxIterations,
-  })
+  const promise = fetchKlinesForRange(symbol, timeframe, rangeMs, cryptoUniverse)
     .then((candles) => {
       klinesCache.set(key, {
         candles,
@@ -152,6 +124,10 @@ export function useIndicatorPerformance(
   symbol: string,
   indicators: IndicatorConfig[],
 ): UseIndicatorPerformanceReturn {
+  // Live crypto universe — used by the dispatcher to pick Binance vs Yahoo.
+  const allSymbols = useAppStore((s) => s.allSymbols);
+  const cryptoUniverse = useMemo(() => new Set(allSymbols), [allSymbols]);
+
   // Auto state (D/W/M)
   const [autoData, setAutoData] = useState<Map<string, IndicatorPerformance>>(
     new Map(),
@@ -200,7 +176,7 @@ export function useIndicatorPerformance(
     for (const tf of uniqueTfs) {
       (async () => {
         try {
-          const candles = await getKlines(symbol, tf, AUTO_RANGE_MS);
+          const candles = await getKlines(symbol, tf, AUTO_RANGE_MS, cryptoUniverse);
           if (cancelled) return;
           // Update auto data for indicators on this timeframe
           setAutoData((prev) => {
@@ -253,7 +229,7 @@ export function useIndicatorPerformance(
       });
 
       try {
-        const candles = await getKlines(symbol, tf, YEARLY_RANGE_MS);
+        const candles = await getKlines(symbol, tf, YEARLY_RANGE_MS, cryptoUniverse);
         const matched = indicators.filter((i) => i.timeframe === tf);
         setYearlyData((prev) => {
           const next = new Map(prev);
@@ -274,7 +250,7 @@ export function useIndicatorPerformance(
         });
       }
     },
-    [indicators, symbol],
+    [indicators, symbol, cryptoUniverse],
   );
 
   const retry = useCallback(() => {

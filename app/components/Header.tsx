@@ -15,6 +15,9 @@ export default function Header({ onOpenAlerts, onOpenSettings }: Props) {
   const timeframe = useAppStore((s) => s.timeframe);
   const setTimeframe = useAppStore((s) => s.setTimeframe);
   const watchlist = useAppStore((s) => s.watchlist);
+  const allSymbols = useAppStore((s) => s.allSymbols);
+  const stockSymbols = useAppStore((s) => s.stockSymbols);
+  const commoditySymbols = useAppStore((s) => s.commoditySymbols);
   const lastPrice = useAppStore((s) => s.lastPrice);
   const priceChange24h = useAppStore((s) => s.priceChange24h);
   const unreadNotifications = useAppStore((s) => s.unreadNotifications);
@@ -22,7 +25,19 @@ export default function Header({ onOpenAlerts, onOpenSettings }: Props) {
   const setMobileMenuOpen = useAppStore((s) => s.setMobileMenuOpen);
   const isStreamConnected = useAppStore((s) => s.isStreamConnected);
 
-  const symbols = Array.from(new Set([...watchlist, ...POPULAR_SYMBOLS]));
+  // Favorites surface at the top of the dropdown; the full Binance universe
+  // plus the curated Yahoo lists follow once they've loaded. Until then,
+  // fall back to a curated popular crypto set so the selector is never empty
+  // on cold start.
+  const cryptoUniverse = allSymbols.length > 0 ? allSymbols : POPULAR_SYMBOLS;
+  const universe = [...cryptoUniverse, ...stockSymbols, ...commoditySymbols];
+  const favoriteEntries = watchlist.filter((s) => s !== selectedSymbol);
+  const restEntries = universe.filter(
+    (s) => s !== selectedSymbol && !watchlist.includes(s),
+  );
+  const symbols = Array.from(
+    new Set([selectedSymbol, ...favoriteEntries, ...restEntries]),
+  );
 
   return (
     <header className="flex items-center justify-between gap-3 border-b border-border bg-background-secondary px-4 py-3">

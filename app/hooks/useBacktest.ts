@@ -2,7 +2,7 @@
 
 import { useCallback, useState } from 'react';
 import { useAppStore } from '../store/store';
-import { fetchKlinesRange } from '../lib/binance';
+import { fetchKlinesForRange } from '../lib/marketData';
 import { runBacktest } from '../lib/backtest';
 import { database } from '../lib/database';
 import type {
@@ -24,6 +24,7 @@ export function useBacktest(): UseBacktestReturn {
   const setShowBacktestPanel = useAppStore((s) => s.setShowBacktestPanel);
   const result = useAppStore((s) => s.lastBacktest);
   const isRunning = useAppStore((s) => s.isBacktestRunning);
+  const allSymbols = useAppStore((s) => s.allSymbols);
   const [error, setError] = useState<string | null>(null);
 
   const run = useCallback(
@@ -31,11 +32,13 @@ export function useBacktest(): UseBacktestReturn {
       setError(null);
       setBacktestRunning(true);
       try {
-        const candles = await fetchKlinesRange(
+        const cryptoUniverse = new Set(allSymbols);
+        const rangeMs = Math.max(0, settings.endTime - settings.startTime);
+        const candles = await fetchKlinesForRange(
           settings.symbol,
           settings.timeframe,
-          settings.startTime,
-          settings.endTime,
+          rangeMs,
+          cryptoUniverse,
         );
         if (candles.length < 30) {
           throw new Error(
@@ -59,7 +62,7 @@ export function useBacktest(): UseBacktestReturn {
         setBacktestRunning(false);
       }
     },
-    [setLastBacktest, setBacktestRunning, setShowBacktestPanel],
+    [setLastBacktest, setBacktestRunning, setShowBacktestPanel, allSymbols],
   );
 
   return { result, isRunning, error, run };

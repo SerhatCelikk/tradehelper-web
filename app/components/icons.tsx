@@ -221,6 +221,40 @@ export const RefreshCw = (p: IconProps) =>
     ),
   });
 
+export const ChevronDown = (p: IconProps) =>
+  base({
+    ...p,
+    children: <polyline points="6 9 12 15 18 9" />,
+  });
+
+export const ChevronRight = (p: IconProps) =>
+  base({
+    ...p,
+    children: <polyline points="9 18 15 12 9 6" />,
+  });
+
+export const Search = (p: IconProps) =>
+  base({
+    ...p,
+    children: (
+      <>
+        <circle cx="11" cy="11" r="8" />
+        <line x1="21" y1="21" x2="16.65" y2="16.65" />
+      </>
+    ),
+  });
+
+export const Lock = (p: IconProps) =>
+  base({
+    ...p,
+    children: (
+      <>
+        <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
+        <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+      </>
+    ),
+  });
+
 export const Loader = (p: IconProps) =>
   base({
     ...p,

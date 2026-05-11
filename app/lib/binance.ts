@@ -302,6 +302,54 @@ export async function fetchSymbols(): Promise<string[]> {
     .map((s: { symbol: string }) => s.symbol);
 }
 
+export interface SymbolInfo {
+  symbol: string;
+  baseAsset: string;
+  quoteAsset: string;
+}
+
+/** All TRADING-status symbols whose quote asset is USDT, with base-asset info. */
+export async function fetchUsdtSymbolsInfo(): Promise<SymbolInfo[]> {
+  const res = await safeFetch('/api/v3/exchangeInfo');
+  if (!res.ok) throw new Error('Failed to load exchange info');
+  const json = await res.json();
+  return (json.symbols as Array<{
+    symbol: string;
+    status: string;
+    quoteAsset: string;
+    baseAsset: string;
+  }>)
+    .filter((s) => s.status === 'TRADING' && s.quoteAsset === 'USDT')
+    .map((s) => ({
+      symbol: s.symbol,
+      baseAsset: s.baseAsset,
+      quoteAsset: s.quoteAsset,
+    }));
+}
+
+/**
+ * Fetches 24h ticker stats for *all* USDT pairs in a single request.
+ * Binance's /ticker/24hr without a symbols param returns ~2000 entries
+ * across every quote asset; we filter to USDT client-side.
+ */
+export async function fetchAllUsdtTickers(): Promise<Ticker[]> {
+  const res = await safeFetch('/api/v3/ticker/24hr');
+  if (!res.ok) {
+    throw new Error(`Binance bulk ticker request failed: ${res.status}`);
+  }
+  const arr: Array<Record<string, string>> = await res.json();
+  return arr
+    .filter((t) => typeof t.symbol === 'string' && t.symbol.endsWith('USDT'))
+    .map((t) => ({
+      symbol: t.symbol,
+      price: parseFloat(t.lastPrice),
+      priceChangePercent: parseFloat(t.priceChangePercent),
+      high24h: parseFloat(t.highPrice),
+      low24h: parseFloat(t.lowPrice),
+      volume24h: parseFloat(t.quoteVolume),
+    }));
+}
+
 /** Quick health check: ping each REST endpoint, return list of reachable ones. */
 export async function diagnoseEndpoints(): Promise<
   { endpoint: string; ok: boolean; latencyMs?: number; error?: string }[]
@@ -389,12 +437,34 @@ export class BinanceWebSocket {
   }
 
   setSubscriptions(subs: Subscription[]) {
+    // Idempotent: if the requested set matches what we already have AND the
+    // socket is open/opening, do nothing. React StrictMode (dev) double-mounts
+    // effects, so without this guard the first paint produces a phantom
+    // reconnect storm even though nothing actually changed.
+    if (
+      this.subsEqual(this.subscriptions, subs) &&
+      this.ws &&
+      (this.ws.readyState === WebSocket.OPEN ||
+        this.ws.readyState === WebSocket.CONNECTING)
+    ) {
+      return;
+    }
     this.subscriptions = subs.slice();
     if (this.subscriptions.length === 0) {
       this.disconnect();
       return;
     }
     this.reconnect();
+  }
+
+  private subsEqual(a: Subscription[], b: Subscription[]): boolean {
+    if (a.length !== b.length) return false;
+    const key = (s: Subscription) => `${s.symbol}|${s.interval}`;
+    const aSet = new Set(a.map(key));
+    for (const s of b) {
+      if (!aSet.has(key(s))) return false;
+    }
+    return true;
   }
 
   addSubscription(sub: Subscription) {
@@ -448,9 +518,42 @@ export class BinanceWebSocket {
     return () => this.connectionListeners.delete(listener);
   }
 
+  /**
+   * Detach all handlers from the current socket *before* closing it, then
+   * drop the reference. Necessary because `WebSocket.close()` fires `onclose`
+   * asynchronously — if we leave the handler live, it runs against an already
+   * mutated `this` (new `intentionallyClosed`, new `hadSuccessfulConnection`,
+   * possibly even a new `this.ws`) and pollutes state: spurious
+   * `notifyConnection(false)`, unwanted `scheduleReconnect()`, endpoint
+   * rotation away from a perfectly good URL, etc.
+   */
+  private killSocket() {
+    if (this.ws) {
+      this.ws.onopen = null;
+      this.ws.onclose = null;
+      this.ws.onerror = null;
+      this.ws.onmessage = null;
+      try {
+        this.ws.close();
+      } catch {
+        /* ignore */
+      }
+      this.ws = null;
+    }
+  }
+
   private reconnect() {
+    // Explicit fresh connection — not a retry. Reset the backoff counter so we
+    // don't inherit attempts from earlier failed sessions and end up sitting
+    // in a 8-30s exponential wait when the user is just switching symbols.
+    this.reconnectAttempts = 0;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.stopPing();
+    this.killSocket();
     this.intentionallyClosed = false;
-    this.disconnect(false);
     this.connect();
   }
 
@@ -506,20 +609,19 @@ export class BinanceWebSocket {
 
   disconnect(intentional = true) {
     this.intentionallyClosed = intentional;
-    this.hadSuccessfulConnection = false;
+    // Intentional teardown is not a failure — reset the backoff counter so the
+    // next session starts at a 1s delay if it ever needs to retry.
+    if (intentional) this.reconnectAttempts = 0;
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
     this.stopPing();
-    if (this.ws) {
-      try {
-        this.ws.close();
-      } catch {
-        /* ignore */
-      }
-      this.ws = null;
-    }
+    // Kill the socket with handlers detached. If we left the live onclose
+    // attached, it would fire asynchronously, potentially after the caller has
+    // already started a new session — and would erroneously notify connection
+    // loss, rotate endpoints, or schedule a reconnect we didn't ask for.
+    this.killSocket();
     if (intentional) this.notifyConnection(false);
   }
 

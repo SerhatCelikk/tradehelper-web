@@ -9,7 +9,7 @@ import BacktestPanel from './components/BacktestPanel';
 import AlertManager from './components/AlertManager';
 import DatabaseManager from './components/DatabaseManager';
 import { useAppStore } from './store/store';
-import { useBinanceStream } from './hooks/useBinanceStream';
+import { useMarketStream } from './hooks/useMarketStream';
 import { useIndicators } from './hooks/useIndicators';
 import { useAlertEvaluator } from './hooks/useAlertEvaluator';
 import ConnectionStatus from './components/ConnectionStatus';
@@ -31,7 +31,7 @@ export default function HomePage() {
   const setMobileMenuOpen = useAppStore((s) => s.setMobileMenuOpen);
 
   // Wire up real-time stream + indicator computation + alert evaluation.
-  useBinanceStream();
+  useMarketStream();
   const indicatorValues = useIndicators();
   useAlertEvaluator(indicatorValues);
 
