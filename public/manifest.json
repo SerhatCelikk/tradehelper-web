@@ -1,0 +1,17 @@
+{
+  "name": "TradeHelper",
+  "short_name": "TradeHelper",
+  "description": "Crypto trading analysis platform with charts, indicators, backtesting and alerts.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#1E1E1E",
+  "theme_color": "#1E1E1E",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}
