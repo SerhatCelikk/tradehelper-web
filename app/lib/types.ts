@@ -191,6 +191,16 @@ export interface BacktestResult {
   equity: { time: number; value: number }[];
 }
 
+/**
+ * Trading direction modes.
+ *   - `long-only`: classic spot-style backtest. BUY opens long, SELL closes it
+ *     (going to cash). Cannot profit from falling prices.
+ *   - `long-short`: stop-and-reverse. Always either long or short — SELL
+ *     closes any long *and* opens a short of the same notional, BUY closes
+ *     the short and goes long. Profits on both sides of the market.
+ */
+export type BacktestDirection = 'long-only' | 'long-short';
+
 export interface BacktestSettings {
   symbol: string;
   timeframe: Timeframe;
@@ -198,6 +208,8 @@ export interface BacktestSettings {
   endTime: number;
   initialCapital: number;
   commission: number;
+  /** Defaults to 'long-only' for backwards compatibility. */
+  direction?: BacktestDirection;
 }
 
 /**

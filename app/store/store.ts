@@ -194,6 +194,17 @@ interface AppState {
   updateIndicatorParams: (id: string, params: IndicatorConfig['params']) => void;
   addIndicator: (cfg: IndicatorConfig) => void;
   removeIndicator: (id: string) => void;
+  /**
+   * Apply an optimizer result. If an indicator of the same type already
+   * exists, the first one is overwritten with the new params + timeframe and
+   * left enabled. Otherwise a fresh config is appended. Returns the id of
+   * the updated/added indicator so the caller can focus it on the chart.
+   */
+  replaceOrAddIndicator: (
+    type: IndicatorConfig['type'],
+    params: IndicatorConfig['params'],
+    timeframe: IndicatorConfig['timeframe'],
+  ) => string;
 
   setLastBacktest: (r: BacktestResult | null) => void;
   setBacktestRunning: (b: boolean) => void;
@@ -392,6 +403,36 @@ export const useAppStore = create<AppState>((set, get) => ({
     const indicators = get().indicators.filter((i) => i.id !== id);
     set({ indicators });
     savePersisted(persistKeys.indicators, indicators);
+  },
+  replaceOrAddIndicator: (type, params, timeframe) => {
+    const current = get().indicators;
+    const idx = current.findIndex((i) => i.type === type);
+    if (idx >= 0) {
+      const existing = current[idx];
+      const next: IndicatorConfig = {
+        ...existing,
+        params: { ...params },
+        timeframe,
+        enabled: true,
+      };
+      const indicators = current.slice();
+      indicators[idx] = next;
+      set({ indicators });
+      savePersisted(persistKeys.indicators, indicators);
+      return next.id;
+    }
+    const def = defaultConfigForType(type);
+    const cfg: IndicatorConfig = {
+      ...def,
+      id: `${type.toLowerCase()}-opt-${Date.now().toString(36)}`,
+      params: { ...params },
+      timeframe,
+      enabled: true,
+    };
+    const indicators = [...current, cfg];
+    set({ indicators });
+    savePersisted(persistKeys.indicators, indicators);
+    return cfg.id;
   },
 
   setLastBacktest: (r) => set({ lastBacktest: r }),

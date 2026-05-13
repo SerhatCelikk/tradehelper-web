@@ -221,6 +221,18 @@ export const RefreshCw = (p: IconProps) =>
     ),
   });
 
+export const Target = (p: IconProps) =>
+  base({
+    ...p,
+    children: (
+      <>
+        <circle cx="12" cy="12" r="10" />
+        <circle cx="12" cy="12" r="6" />
+        <circle cx="12" cy="12" r="2" />
+      </>
+    ),
+  });
+
 export const ChevronDown = (p: IconProps) =>
   base({
     ...p,

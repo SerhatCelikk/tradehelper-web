@@ -8,6 +8,7 @@ import {
 } from '../hooks/useIndicatorPerformance';
 import { describeStrategy } from '../lib/indicatorStrategies';
 import IndicatorSettingsModal from './IndicatorSettingsModal';
+import OptimizerModal from './OptimizerModal';
 import {
   Settings,
   RefreshCw,
@@ -15,6 +16,7 @@ import {
   LineChart,
   AlertCircle,
   Play,
+  Target,
 } from './icons';
 import type { IndicatorConfig } from '../lib/types';
 import { defaultConfigForType } from '../store/store';
@@ -28,6 +30,7 @@ const AUTO_RANGES: { key: 'daily' | 'weekly' | 'monthly'; label: string }[] = [
 export default function IndicatorPerformancePanel() {
   const indicators = useAppStore((s) => s.indicators);
   const symbol = useAppStore((s) => s.selectedSymbol);
+  const timeframe = useAppStore((s) => s.timeframe);
   const setIndicators = useAppStore((s) => s.setIndicators);
   const focusedIndicatorId = useAppStore((s) => s.focusedIndicatorId);
   const setFocusedIndicator = useAppStore((s) => s.setFocusedIndicator);
@@ -46,6 +49,7 @@ export default function IndicatorPerformancePanel() {
 
   const [editingId, setEditingId] = useState<string | null>(null);
   const editing = indicators.find((i) => i.id === editingId) ?? null;
+  const [optimizerOpen, setOptimizerOpen] = useState(false);
 
   const handleSave = (next: IndicatorConfig) => {
     setIndicators(indicators.map((i) => (i.id === next.id ? next : i)));
@@ -101,6 +105,14 @@ export default function IndicatorPerformancePanel() {
               loading…
             </span>
           )}
+          <button
+            className="btn-ghost flex items-center gap-1 px-1.5 py-0.5 text-[11px] text-accent hover:text-accent"
+            onClick={() => setOptimizerOpen(true)}
+            title={`Find the best indicator + params for ${symbol} on ${timeframe}`}
+          >
+            <Target size={11} />
+            optimize
+          </button>
           <button
             className="btn-ghost flex items-center gap-1 px-1.5 py-0.5 text-[11px]"
             onClick={retry}
@@ -163,6 +175,14 @@ export default function IndicatorPerformancePanel() {
           config={editing}
           onSave={handleSave}
           onClose={() => setEditingId(null)}
+        />
+      )}
+
+      {optimizerOpen && (
+        <OptimizerModal
+          symbol={symbol}
+          initialTimeframe={timeframe}
+          onClose={() => setOptimizerOpen(false)}
         />
       )}
     </section>

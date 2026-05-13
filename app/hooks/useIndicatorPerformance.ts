@@ -352,16 +352,17 @@ function computeRange(
 
   const strategy = defaultStrategyFor(ind);
   try {
-    // Backtest over the *whole* candle history so the long/flat state at the
-    // window's left edge reflects what really happened, not an artificial
-    // flat reset. Trades are then filtered to the requested range for
-    // display. This keeps the Weekly/Monthly counts here aligned with the
-    // markers visible on the chart.
+    // Backtest over the *whole* candle history so the long/short state at
+    // the window's left edge reflects what really happened, not an
+    // artificial reset. Trades are then filtered to the requested range
+    // for display. Long-short mode means SELL signals open shorts instead
+    // of sitting in cash — strategies can profit on the way down too.
     const result = runBacktest(candles, strategy, {
       symbol: ind.id,
       timeframe: ind.timeframe,
       initialCapital: 10_000,
       commission: 0.001,
+      direction: 'long-short',
     });
     return {
       ...filterToRange(result, candles[evalStart].time),
@@ -409,13 +410,21 @@ function filterToRange(
   const endEq = equity[equity.length - 1].value;
   const ret = startEq > 0 ? ((endEq - startEq) / startEq) * 100 : 0;
 
-  const closed = trades.filter((t) => t.type === 'SELL' && t.pnl !== undefined);
+  // Any trade carrying a realised pnl is a closed round-trip. In long-short
+  // mode that includes BUY trades that closed a prior short — filtering by
+  // `type === 'SELL'` here would silently drop those from the win-rate
+  // calculation.
+  const closed = trades.filter((t) => t.pnl !== undefined);
   const wins = closed.filter((t) => (t.pnl ?? 0) > 0);
   const winRate = closed.length > 0 ? (wins.length / closed.length) * 100 : 0;
 
   return {
     totalReturnPercent: ret,
-    numberOfTrades: trades.length,
+    // Show closed round-trips rather than every signal event so the win-rate
+    // denominator matches the displayed trade count — "3 tr · 67% win" is
+    // legible; "5 tr · 67% win" with two of those being still-open entries
+    // confuses the math.
+    numberOfTrades: closed.length,
     winRate,
   };
 }

@@ -84,6 +84,7 @@ export default function ChartContainer({ indicatorValues }: Props) {
       candleData,
       enabledIndicators,
       defaultStrategyFor,
+      'long-short',
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [candleCount, lastCandleTime, indicatorsFingerprint, focusFingerprint]);
@@ -132,7 +133,11 @@ export default function ChartContainer({ indicatorValues }: Props) {
         if (cancelled) return;
 
         const strategy = defaultStrategyFor(focusedIndicator);
-        const rawSignals = computeStrategySignals(indCandles, strategy);
+        const rawSignals = computeStrategySignals(
+          indCandles,
+          strategy,
+          'long-short',
+        );
         const indSignals: ChartSignal[] = rawSignals.map((s) => ({
           time: s.time,
           type: s.type,

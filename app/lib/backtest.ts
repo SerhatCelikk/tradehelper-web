@@ -1,4 +1,5 @@
 import type {
+  BacktestDirection,
   BacktestPerformance,
   BacktestResult,
   BacktestSettings,
@@ -252,13 +253,20 @@ export function runBacktest(
   settings: Pick<BacktestSettings, 'initialCapital' | 'commission'> & {
     symbol: string;
     timeframe: BacktestSettings['timeframe'];
+    direction?: BacktestDirection;
   },
 ): BacktestResult {
   const initialCapital = settings.initialCapital;
   const commission = settings.commission;
+  const direction: BacktestDirection = settings.direction ?? 'long-only';
+  const allowShort = direction === 'long-short';
   const pre = precompute(candles, strategy.indicators);
 
   let cash = initialCapital;
+  // -1 = short, 0 = flat, 1 = long. Typed as plain number so TS doesn't
+  // narrow it after a literal initialiser — the helper functions below
+  // mutate this value and the compiler can't track that across calls.
+  let positionSide: number = 0;
   let positionQty = 0;
   let positionEntryPrice = 0;
   const trades: Trade[] = [];
@@ -268,6 +276,58 @@ export function runBacktest(
   let maxDrawdownPct = 0;
   const dailyReturns: number[] = [];
   let lastEquity = initialCapital;
+
+  const closeLong = (exitPrice: number): { pnl: number; pnlPercent: number } => {
+    const proceeds = positionQty * exitPrice;
+    const fee = proceeds * commission;
+    const net = proceeds - fee;
+    const cost = positionQty * positionEntryPrice;
+    const pnl = net - cost;
+    const pnlPercent = cost > 0 ? (pnl / cost) * 100 : 0;
+    cash = net;
+    positionQty = 0;
+    positionSide = 0;
+    positionEntryPrice = 0;
+    return { pnl, pnlPercent };
+  };
+
+  const closeShort = (exitPrice: number): { pnl: number; pnlPercent: number } => {
+    // Equity proxy for shorts: cash stayed parked at the open-time level
+    // (no proceeds credited) and we settle the difference here. Treats the
+    // short as a fully-collateralised bet rather than a leveraged margin
+    // trade — close enough for ranking strategies in a backtest.
+    const exitFee = positionQty * exitPrice * commission;
+    const pnl = (positionEntryPrice - exitPrice) * positionQty - exitFee;
+    const cost = positionQty * positionEntryPrice;
+    const pnlPercent = cost > 0 ? (pnl / cost) * 100 : 0;
+    cash += pnl;
+    positionQty = 0;
+    positionSide = 0;
+    positionEntryPrice = 0;
+    return { pnl, pnlPercent };
+  };
+
+  const openLong = (entryPrice: number) => {
+    const fee = cash * commission;
+    const investable = cash - fee;
+    const qty = investable / entryPrice;
+    positionQty = qty;
+    positionEntryPrice = entryPrice;
+    positionSide = 1;
+    cash = 0;
+    return qty;
+  };
+
+  const openShort = (entryPrice: number) => {
+    const fee = cash * commission;
+    const notional = cash - fee;
+    const qty = notional / entryPrice;
+    positionQty = qty;
+    positionEntryPrice = entryPrice;
+    positionSide = -1;
+    cash -= fee; // pay opening fee; remaining cash sits as the margin reserve
+    return qty;
+  };
 
   for (let i = 0; i < candles.length; i++) {
     const candle = candles[i];
@@ -281,48 +341,76 @@ export function runBacktest(
       indicators: strategy.indicators,
     };
 
-    const isLong = positionQty > 0;
-    const buy = !isLong
+    // Signal eligibility per direction mode. In long-only, BUY only when
+    // flat and SELL only when long — same state machine as before. In
+    // long-short the side flips on every actionable signal so we evaluate
+    // BUY whenever we're not already long and SELL whenever we're not
+    // already short.
+    const canBuy = allowShort ? positionSide !== 1 : positionSide === 0;
+    const canSell = allowShort ? positionSide !== -1 : positionSide === 1;
+
+    const buy = canBuy
       ? evaluateConditions(strategy.buyConditions, strategy.logic, ctx)
       : false;
-    const sell = isLong
+    const sell = canSell
       ? evaluateConditions(strategy.sellConditions, strategy.logic, ctx)
       : false;
 
     if (buy) {
-      const fee = cash * commission;
-      const investable = cash - fee;
-      const qty = investable / candle.close;
-      positionQty = qty;
-      positionEntryPrice = candle.close;
-      cash = 0;
+      // Close any open short first, then enter long. PnL on the BUY trade
+      // record reflects the realised short profit (if any).
+      let closedPnl: number | undefined;
+      let closedPnlPct: number | undefined;
+      if (positionSide === -1) {
+        const r = closeShort(candle.close);
+        closedPnl = r.pnl;
+        closedPnlPct = r.pnlPercent;
+      }
+      const qty = openLong(candle.close);
       trades.push({
         type: 'BUY',
         time: candle.time,
         price: candle.close,
         quantity: qty,
+        ...(closedPnl !== undefined && { pnl: closedPnl, pnlPercent: closedPnlPct }),
       });
     } else if (sell) {
-      const proceeds = positionQty * candle.close;
-      const fee = proceeds * commission;
-      const net = proceeds - fee;
-      const cost = positionQty * positionEntryPrice;
-      const pnl = net - cost;
-      const pnlPercent = cost > 0 ? (pnl / cost) * 100 : 0;
-      cash = net;
-      trades.push({
-        type: 'SELL',
-        time: candle.time,
-        price: candle.close,
-        quantity: positionQty,
-        pnl,
-        pnlPercent,
-      });
-      positionQty = 0;
-      positionEntryPrice = 0;
+      let closedPnl: number | undefined;
+      let closedPnlPct: number | undefined;
+      if (positionSide === 1) {
+        const r = closeLong(candle.close);
+        closedPnl = r.pnl;
+        closedPnlPct = r.pnlPercent;
+      }
+      if (allowShort) {
+        const qty = openShort(candle.close);
+        trades.push({
+          type: 'SELL',
+          time: candle.time,
+          price: candle.close,
+          quantity: qty,
+          ...(closedPnl !== undefined && { pnl: closedPnl, pnlPercent: closedPnlPct }),
+        });
+      } else {
+        // long-only: SELL just exits to cash, with the realised long PnL
+        trades.push({
+          type: 'SELL',
+          time: candle.time,
+          price: candle.close,
+          quantity: 0,
+          pnl: closedPnl ?? 0,
+          pnlPercent: closedPnlPct ?? 0,
+        });
+      }
     }
 
-    const eq = cash + positionQty * candle.close;
+    // Mark-to-market equity.
+    let eq: number;
+    if (positionSide === 1) eq = cash + positionQty * candle.close;
+    else if (positionSide === -1)
+      eq = cash + (positionEntryPrice - candle.close) * positionQty;
+    else eq = cash;
+
     equity.push({ time: candle.time, value: eq });
     if (eq > peak) peak = eq;
     const dd = peak - eq;
@@ -335,25 +423,37 @@ export function runBacktest(
     lastEquity = eq;
   }
 
-  // Force-close any open position at the last close
-  if (positionQty > 0 && candles.length > 0) {
+  // Force-close anything still open so realised PnL flows into final stats.
+  if (positionSide !== 0 && candles.length > 0) {
     const last = candles[candles.length - 1];
-    const proceeds = positionQty * last.close;
-    const fee = proceeds * commission;
-    const net = proceeds - fee;
-    const cost = positionQty * positionEntryPrice;
-    const pnl = net - cost;
-    const pnlPercent = cost > 0 ? (pnl / cost) * 100 : 0;
-    cash = net;
-    trades.push({
-      type: 'SELL',
-      time: last.time,
-      price: last.close,
-      quantity: positionQty,
-      pnl,
-      pnlPercent,
-    });
-    positionQty = 0;
+    const qtyAtClose = positionQty;
+    let pnl = 0;
+    let pnlPct = 0;
+    if (positionSide === 1) {
+      const r = closeLong(last.close);
+      pnl = r.pnl;
+      pnlPct = r.pnlPercent;
+      trades.push({
+        type: 'SELL',
+        time: last.time,
+        price: last.close,
+        quantity: qtyAtClose,
+        pnl,
+        pnlPercent: pnlPct,
+      });
+    } else {
+      const r = closeShort(last.close);
+      pnl = r.pnl;
+      pnlPct = r.pnlPercent;
+      trades.push({
+        type: 'BUY',
+        time: last.time,
+        price: last.close,
+        quantity: qtyAtClose,
+        pnl,
+        pnlPercent: pnlPct,
+      });
+    }
   }
 
   const finalCapital = cash;
@@ -361,9 +461,12 @@ export function runBacktest(
   const totalReturnPercent =
     initialCapital > 0 ? (totalReturn / initialCapital) * 100 : 0;
 
+  // Any trade carrying a realised pnl counts as a closed round-trip — in
+  // long-short mode this includes BUY trades that closed a prior short
+  // alongside the usual SELLs that closed a long.
   const closedTrades = trades.filter(
     (t): t is Trade & { pnl: number; pnlPercent: number } =>
-      t.type === 'SELL' && t.pnl !== undefined,
+      t.pnl !== undefined,
   );
   const wins = closedTrades.filter((t) => t.pnl > 0);
   const losses = closedTrades.filter((t) => t.pnl <= 0);
@@ -399,7 +502,10 @@ export function runBacktest(
     totalReturn,
     totalReturnPercent,
     winRate,
-    numberOfTrades: trades.length,
+    // Count closed round-trips, not raw signal events. In long-short mode
+    // the very first signal only opens (no pnl yet) and would otherwise
+    // inflate the count without contributing to win-rate.
+    numberOfTrades: closedTrades.length,
     winningTrades: wins.length,
     losingTrades: losses.length,
     maxDrawdown: maxDrawdownAbs,
@@ -421,21 +527,142 @@ export function runBacktest(
   };
 }
 
+/* -------------------------------------------------------------------------- */
+/*                       Sub-range performance extraction                     */
+/* -------------------------------------------------------------------------- */
+
+function emptyPerformance(): BacktestPerformance {
+  return {
+    initialCapital: 0,
+    finalCapital: 0,
+    totalReturn: 0,
+    totalReturnPercent: 0,
+    winRate: 0,
+    numberOfTrades: 0,
+    winningTrades: 0,
+    losingTrades: 0,
+    maxDrawdown: 0,
+    maxDrawdownPercent: 0,
+    sharpeRatio: 0,
+    averageWin: 0,
+    averageLoss: 0,
+    profitFactor: 0,
+  };
+}
+
+/**
+ * Computes performance stats over a slice of an already-run backtest. Use
+ * this when you want to ask "how did this strategy do between time A and
+ * time B?" without re-running the engine — important because re-running a
+ * sub-window from a flat start gives different results than letting the
+ * state evolve continuously through earlier history.
+ *
+ * This is what makes the optimizer's "last month" return match the
+ * indicator-performance-card's Monthly stat: both rely on a single
+ * continuous backtest and filter the same way.
+ */
+export function computePerformanceInRange(
+  result: BacktestResult,
+  startSec: number,
+  endSec: number,
+): BacktestPerformance {
+  const trades = result.trades.filter(
+    (t) => t.time >= startSec && t.time <= endSec,
+  );
+  const equity = result.equity.filter(
+    (e) => e.time >= startSec && e.time <= endSec,
+  );
+  if (equity.length < 2) return emptyPerformance();
+
+  const startEq = equity[0].value;
+  const endEq = equity[equity.length - 1].value;
+  const totalReturn = endEq - startEq;
+  const totalReturnPercent = startEq > 0 ? (totalReturn / startEq) * 100 : 0;
+
+  const closed = trades.filter(
+    (t): t is Trade & { pnl: number; pnlPercent: number } =>
+      t.pnl !== undefined,
+  );
+  const wins = closed.filter((t) => t.pnl > 0);
+  const losses = closed.filter((t) => t.pnl <= 0);
+  const winRate = closed.length > 0 ? (wins.length / closed.length) * 100 : 0;
+
+  // Drawdown rebased to the start of the slice — a drawdown that bottomed
+  // before our window starts shouldn't count against us here.
+  let peak = startEq;
+  let maxDdAbs = 0;
+  let maxDdPct = 0;
+  for (const e of equity) {
+    if (e.value > peak) peak = e.value;
+    const dd = peak - e.value;
+    const ddPct = peak > 0 ? (dd / peak) * 100 : 0;
+    if (dd > maxDdAbs) maxDdAbs = dd;
+    if (ddPct > maxDdPct) maxDdPct = ddPct;
+  }
+
+  const returns: number[] = [];
+  for (let i = 1; i < equity.length; i++) {
+    const prev = equity[i - 1].value;
+    if (prev > 0) returns.push((equity[i].value - prev) / prev);
+  }
+  const meanRet =
+    returns.length > 0 ? returns.reduce((s, x) => s + x, 0) / returns.length : 0;
+  const variance =
+    returns.length > 0
+      ? returns.reduce((s, x) => s + (x - meanRet) ** 2, 0) / returns.length
+      : 0;
+  const stddev = Math.sqrt(variance);
+  const sharpe = stddev > 0 ? (meanRet / stddev) * Math.sqrt(365) : 0;
+
+  const grossProfit = wins.reduce((s, t) => s + t.pnl, 0);
+  const grossLoss = Math.abs(losses.reduce((s, t) => s + t.pnl, 0));
+  const profitFactor =
+    grossLoss > 0
+      ? grossProfit / grossLoss
+      : grossProfit > 0
+        ? Infinity
+        : 0;
+
+  return {
+    initialCapital: startEq,
+    finalCapital: endEq,
+    totalReturn,
+    totalReturnPercent,
+    winRate,
+    numberOfTrades: closed.length,
+    winningTrades: wins.length,
+    losingTrades: losses.length,
+    maxDrawdown: maxDdAbs,
+    maxDrawdownPercent: maxDdPct,
+    sharpeRatio: Number.isFinite(sharpe) ? sharpe : 0,
+    averageWin: wins.length > 0 ? grossProfit / wins.length : 0,
+    averageLoss: losses.length > 0 ? -grossLoss / losses.length : 0,
+    profitFactor: Number.isFinite(profitFactor) ? profitFactor : 0,
+  };
+}
+
 /**
  * Lightweight "what does this strategy say?" pass used to drive on-chart
- * signal markers. Mirrors `runBacktest`'s state machine (long/flat,
- * alternating buy↔sell) but skips portfolio accounting, fees, equity tracking,
- * and the force-close-at-end behaviour — none of which are meaningful when
- * we're just annotating the chart with the moment a rule fired.
+ * signal markers. Mirrors `runBacktest`'s state machine but skips portfolio
+ * accounting, fees, equity tracking, and the force-close-at-end behaviour —
+ * none of which are meaningful when we're just annotating the chart with the
+ * moment a rule fired.
+ *
+ * In `long-short` mode the state alternates between long and short (no flat
+ * stretches once trading starts), so SELL signals can fire even when no
+ * prior long position was open — the strategy is interpreting "rule said
+ * SELL" as "be short here".
  */
 export function computeStrategySignals(
   candles: Candle[],
   strategy: Strategy,
+  direction: BacktestDirection = 'long-only',
 ): Array<{ time: number; type: 'BUY' | 'SELL' }> {
   if (candles.length === 0) return [];
   const pre = precompute(candles, strategy.indicators);
   const out: Array<{ time: number; type: 'BUY' | 'SELL' }> = [];
-  let inLong = false;
+  const allowShort = direction === 'long-short';
+  let side: -1 | 0 | 1 = 0;
 
   for (let i = 0; i < candles.length; i++) {
     const ctx: ConditionContext = {
@@ -447,19 +674,22 @@ export function computeStrategySignals(
       indicators: strategy.indicators,
     };
 
-    const buy = !inLong
+    const canBuy = allowShort ? side !== 1 : side === 0;
+    const canSell = allowShort ? side !== -1 : side === 1;
+
+    const buy = canBuy
       ? evaluateConditions(strategy.buyConditions, strategy.logic, ctx)
       : false;
-    const sell = inLong
+    const sell = canSell
       ? evaluateConditions(strategy.sellConditions, strategy.logic, ctx)
       : false;
 
     if (buy) {
       out.push({ time: candles[i].time, type: 'BUY' });
-      inLong = true;
+      side = 1;
     } else if (sell) {
       out.push({ time: candles[i].time, type: 'SELL' });
-      inLong = false;
+      side = allowShort ? -1 : 0;
     }
   }
   return out;
@@ -498,6 +728,7 @@ export function computeMultiIndicatorSignals(
   candles: Candle[],
   indicators: IndicatorConfig[],
   strategyFor: (ind: IndicatorConfig) => Strategy,
+  direction: BacktestDirection = 'long-only',
 ): ChartSignal[] {
   if (candles.length === 0 || indicators.length === 0) return [];
   const merged = new Map<string, ChartSignal>();
@@ -505,7 +736,7 @@ export function computeMultiIndicatorSignals(
     let signals: Array<{ time: number; type: 'BUY' | 'SELL' }>;
     try {
       const strategy = strategyFor(ind);
-      signals = computeStrategySignals(candles, strategy);
+      signals = computeStrategySignals(candles, strategy, direction);
     } catch (err) {
       console.warn(`Signal calc failed for ${ind.type}:`, err);
       continue;
