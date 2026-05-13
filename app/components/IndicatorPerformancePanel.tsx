@@ -9,6 +9,7 @@ import {
 import { describeStrategy } from '../lib/indicatorStrategies';
 import IndicatorSettingsModal from './IndicatorSettingsModal';
 import OptimizerModal from './OptimizerModal';
+import CustomStrategyTab from './CustomStrategyTab';
 import {
   Settings,
   RefreshCw,
@@ -16,6 +17,7 @@ import {
   LineChart,
   AlertCircle,
   Play,
+  Plus,
   Target,
 } from './icons';
 import type { IndicatorConfig } from '../lib/types';
@@ -27,6 +29,8 @@ const AUTO_RANGES: { key: 'daily' | 'weekly' | 'monthly'; label: string }[] = [
   { key: 'monthly', label: 'Monthly' },
 ];
 
+type TabKey = 'indicators' | 'strategy';
+
 export default function IndicatorPerformancePanel() {
   const indicators = useAppStore((s) => s.indicators);
   const symbol = useAppStore((s) => s.selectedSymbol);
@@ -34,6 +38,9 @@ export default function IndicatorPerformancePanel() {
   const setIndicators = useAppStore((s) => s.setIndicators);
   const focusedIndicatorId = useAppStore((s) => s.focusedIndicatorId);
   const setFocusedIndicator = useAppStore((s) => s.setFocusedIndicator);
+  const customStrategy = useAppStore((s) => s.customStrategy);
+  const addToCustomStrategy = useAppStore((s) => s.addToCustomStrategy);
+  const [activeTab, setActiveTab] = useState<TabKey>('indicators');
 
   const {
     data,
@@ -88,87 +95,83 @@ export default function IndicatorPerformancePanel() {
     setFocusedIndicator(id);
   };
 
+  const handleAddToStrategy = (ind: IndicatorConfig) => {
+    addToCustomStrategy(ind);
+    setActiveTab('strategy');
+  };
+
+  const customCount = customStrategy.indicators.length;
+
   return (
     <section className="flex flex-col h-full">
-      <header className="flex items-center justify-between border-b border-border px-4 py-2.5">
-        <h2 className="text-xs font-semibold text-foreground-muted uppercase tracking-wide flex items-center gap-2">
-          <LineChart size={12} />
-          Indicator performance
-          <span className="text-foreground-subtle font-normal normal-case">
-            · {symbol}
-          </span>
-        </h2>
-        <div className="flex items-center gap-2 text-[11px] text-foreground-subtle">
-          {globalLoading && (
-            <span className="flex items-center gap-1 text-accent">
-              <Loader size={11} />
-              loading…
-            </span>
+      <div className="flex items-stretch border-b border-border flex-shrink-0">
+        <TabButton
+          active={activeTab === 'indicators'}
+          onClick={() => setActiveTab('indicators')}
+          icon={<LineChart size={12} />}
+          label="Indicators"
+        />
+        <TabButton
+          active={activeTab === 'strategy'}
+          onClick={() => setActiveTab('strategy')}
+          icon={<Plus size={12} />}
+          label="My Strategy"
+          badge={customCount > 0 ? String(customCount) : undefined}
+        />
+        <div className="ml-auto flex items-center gap-2 px-3 text-[11px] text-foreground-subtle">
+          {activeTab === 'indicators' && (
+            <>
+              <span className="hidden sm:inline text-foreground-subtle">
+                · {symbol}
+              </span>
+              {globalLoading && (
+                <span className="flex items-center gap-1 text-accent">
+                  <Loader size={11} />
+                  loading…
+                </span>
+              )}
+              <button
+                className="btn-ghost flex items-center gap-1 px-1.5 py-0.5 text-[11px] text-accent hover:text-accent"
+                onClick={() => setOptimizerOpen(true)}
+                title={`Find the best indicator + params for ${symbol} on ${timeframe}`}
+              >
+                <Target size={11} />
+                optimize
+              </button>
+              <button
+                className="btn-ghost flex items-center gap-1 px-1.5 py-0.5 text-[11px]"
+                onClick={retry}
+                title="Refresh data"
+              >
+                <RefreshCw size={11} />
+                refresh
+              </button>
+            </>
           )}
-          <button
-            className="btn-ghost flex items-center gap-1 px-1.5 py-0.5 text-[11px] text-accent hover:text-accent"
-            onClick={() => setOptimizerOpen(true)}
-            title={`Find the best indicator + params for ${symbol} on ${timeframe}`}
-          >
-            <Target size={11} />
-            optimize
-          </button>
-          <button
-            className="btn-ghost flex items-center gap-1 px-1.5 py-0.5 text-[11px]"
-            onClick={retry}
-            title="Refresh data"
-          >
-            <RefreshCw size={11} />
-            refresh
-          </button>
         </div>
-      </header>
-
-      {globalError && (
-        <div className="border-b border-danger/30 bg-danger/10 px-4 py-3">
-          <div className="flex items-start gap-2">
-            <AlertCircle
-              size={14}
-              className="text-danger flex-shrink-0 mt-0.5"
-            />
-            <div className="flex-1 min-w-0">
-              <div className="text-xs font-semibold text-danger mb-1">
-                Could not load market data
-              </div>
-              <div className="text-[11px] text-foreground-muted leading-relaxed break-words">
-                {globalError}
-              </div>
-            </div>
-            <button
-              className="btn-secondary text-xs px-2 py-1 flex-shrink-0"
-              onClick={retry}
-            >
-              Retry
-            </button>
-          </div>
-        </div>
-      )}
-
-      <div className="flex-1 overflow-y-auto p-3 space-y-3">
-        {indicators.map((ind) => (
-          <IndicatorCard
-            key={ind.id}
-            indicator={ind}
-            performance={data.get(ind.id)}
-            loading={isLoadingFor(ind)}
-            error={errorFor(ind)}
-            yearlyLoading={isYearlyLoading(ind)}
-            yearlyError={yearlyErrorFor(ind)}
-            isFocused={focusedIndicatorId === ind.id}
-            onRunYearly={() => runYearly(ind.id)}
-            onOpenSettings={() => setEditingId(ind.id)}
-            onReset={() => handleResetCard(ind.id)}
-            onToggleOverlay={() => handleToggleOverlay(ind.id)}
-            onToggleFocus={() => handleToggleFocus(ind.id)}
-            onRetry={retry}
-          />
-        ))}
       </div>
+
+      {activeTab === 'strategy' ? (
+        <CustomStrategyTab />
+      ) : (
+        <IndicatorsTabBody
+          indicators={indicators}
+          data={data}
+          globalError={globalError}
+          isLoadingFor={isLoadingFor}
+          errorFor={errorFor}
+          isYearlyLoading={isYearlyLoading}
+          yearlyErrorFor={yearlyErrorFor}
+          focusedIndicatorId={focusedIndicatorId}
+          onRunYearly={runYearly}
+          onOpenSettings={setEditingId}
+          onReset={handleResetCard}
+          onToggleOverlay={handleToggleOverlay}
+          onToggleFocus={handleToggleFocus}
+          onAddToStrategy={handleAddToStrategy}
+          onRetry={retry}
+        />
+      )}
 
       {editing && (
         <IndicatorSettingsModal
@@ -189,6 +192,130 @@ export default function IndicatorPerformancePanel() {
   );
 }
 
+function TabButton({
+  active,
+  onClick,
+  icon,
+  label,
+  badge,
+}: {
+  active: boolean;
+  onClick: () => void;
+  icon: React.ReactNode;
+  label: string;
+  badge?: string;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={`px-4 py-2.5 text-xs font-semibold uppercase tracking-wide flex items-center gap-1.5 border-b-2 transition-colors ${
+        active
+          ? 'border-accent text-foreground'
+          : 'border-transparent text-foreground-muted hover:text-foreground'
+      }`}
+    >
+      {icon}
+      {label}
+      {badge !== undefined && (
+        <span
+          className={`text-[10px] font-mono px-1.5 rounded-full ${
+            active ? 'bg-accent text-white' : 'bg-background-tertiary text-foreground-muted'
+          }`}
+        >
+          {badge}
+        </span>
+      )}
+    </button>
+  );
+}
+
+interface IndicatorsTabBodyProps {
+  indicators: IndicatorConfig[];
+  data: Map<string, IndicatorPerformance>;
+  globalError: string | null;
+  isLoadingFor: (ind: IndicatorConfig) => boolean;
+  errorFor: (ind: IndicatorConfig) => string | null;
+  isYearlyLoading: (ind: IndicatorConfig) => boolean;
+  yearlyErrorFor: (ind: IndicatorConfig) => string | null;
+  focusedIndicatorId: string | null;
+  onRunYearly: (id: string) => void;
+  onOpenSettings: (id: string) => void;
+  onReset: (id: string) => void;
+  onToggleOverlay: (id: string) => void;
+  onToggleFocus: (id: string) => void;
+  onAddToStrategy: (ind: IndicatorConfig) => void;
+  onRetry: () => void;
+}
+
+function IndicatorsTabBody({
+  indicators,
+  data,
+  globalError,
+  isLoadingFor,
+  errorFor,
+  isYearlyLoading,
+  yearlyErrorFor,
+  focusedIndicatorId,
+  onRunYearly,
+  onOpenSettings,
+  onReset,
+  onToggleOverlay,
+  onToggleFocus,
+  onAddToStrategy,
+  onRetry,
+}: IndicatorsTabBodyProps) {
+  return (
+    <>
+      {globalError && (
+        <div className="border-b border-danger/30 bg-danger/10 px-4 py-3">
+          <div className="flex items-start gap-2">
+            <AlertCircle
+              size={14}
+              className="text-danger flex-shrink-0 mt-0.5"
+            />
+            <div className="flex-1 min-w-0">
+              <div className="text-xs font-semibold text-danger mb-1">
+                Could not load market data
+              </div>
+              <div className="text-[11px] text-foreground-muted leading-relaxed break-words">
+                {globalError}
+              </div>
+            </div>
+            <button
+              className="btn-secondary text-xs px-2 py-1 flex-shrink-0"
+              onClick={onRetry}
+            >
+              Retry
+            </button>
+          </div>
+        </div>
+      )}
+
+      <div className="flex-1 overflow-y-auto p-3 space-y-3">
+        {indicators.map((ind) => (
+          <IndicatorCard
+            key={ind.id}
+            indicator={ind}
+            performance={data.get(ind.id)}
+            loading={isLoadingFor(ind)}
+            error={errorFor(ind)}
+            yearlyLoading={isYearlyLoading(ind)}
+            yearlyError={yearlyErrorFor(ind)}
+            isFocused={focusedIndicatorId === ind.id}
+            onRunYearly={() => onRunYearly(ind.id)}
+            onOpenSettings={() => onOpenSettings(ind.id)}
+            onReset={() => onReset(ind.id)}
+            onToggleOverlay={() => onToggleOverlay(ind.id)}
+            onToggleFocus={() => onToggleFocus(ind.id)}
+            onAddToStrategy={() => onAddToStrategy(ind)}
+            onRetry={onRetry}
+          />
+        ))}
+      </div>
+    </>
+  );
+}
+
 interface CardProps {
   indicator: IndicatorConfig;
   performance: IndicatorPerformance | undefined;
@@ -202,6 +329,7 @@ interface CardProps {
   onReset: () => void;
   onToggleOverlay: () => void;
   onToggleFocus: () => void;
+  onAddToStrategy: () => void;
   onRetry: () => void;
 }
 
@@ -218,6 +346,7 @@ function IndicatorCard({
   onReset,
   onToggleOverlay,
   onToggleFocus,
+  onAddToStrategy,
   onRetry,
 }: CardProps) {
   const headerLine = formatHeader(indicator);
@@ -294,6 +423,15 @@ function IndicatorCard({
             aria-pressed={isFocused}
           >
             focus
+          </button>
+          <button
+            type="button"
+            onClick={onAddToStrategy}
+            className="text-[10px] px-1.5 py-1 rounded transition-colors text-foreground-muted hover:bg-background-elevated flex items-center gap-0.5"
+            title="Add this indicator to My Strategy"
+          >
+            <Plus size={11} />
+            strategy
           </button>
           <button
             className="btn-ghost p-1.5 text-foreground-muted"

@@ -8,6 +8,12 @@ import {
   computeStrategySignals,
 } from '../lib/backtest';
 import { defaultStrategyFor } from '../lib/indicatorStrategies';
+import {
+  computeCompositeHints,
+  signalsFromHints,
+  zonesFromHints,
+  type BarHint,
+} from '../lib/compositeStrategy';
 import { precisionFallback } from '../lib/marketData';
 import { getCachedKlines } from '../lib/klinesCache';
 import type {
@@ -39,6 +45,7 @@ export default function ChartContainer({ indicatorValues }: Props) {
   const focusedIndicatorId = useAppStore((s) => s.focusedIndicatorId);
   const symbolPrecisions = useAppStore((s) => s.symbolPrecisions);
   const allSymbols = useAppStore((s) => s.allSymbols);
+  const customStrategy = useAppStore((s) => s.customStrategy);
 
   // Only indicators flagged for chart overlay produce live signal markers in
   // the default ("show everything") mode. In focus mode the highlighted
@@ -75,24 +82,116 @@ export default function ChartContainer({ indicatorValues }: Props) {
     [focusedIndicator],
   );
 
-  // ---- Non-focus signals: synchronous, computed from chart-tf candles ----
-  const multiSignals: ChartSignal[] = useMemo(() => {
-    if (candleCount === 0 || enabledIndicators.length === 0 || focusedIndicator) {
-      return [];
-    }
-    return computeMultiIndicatorSignals(
-      candleData,
-      enabledIndicators,
-      defaultStrategyFor,
-      'long-short',
-    );
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [candleCount, lastCandleTime, indicatorsFingerprint, focusFingerprint]);
+  // Fingerprint for the composite strategy — covers its members, params,
+  // logic and the chart/focus toggles so the effects below re-run when any
+  // of them changes.
+  const strategyFingerprint = useMemo(
+    () =>
+      customStrategy.indicators
+        .map((i) => `${i.type}:${i.timeframe}:${JSON.stringify(i.params)}`)
+        .join('|') +
+      `|logic:${customStrategy.logic}` +
+      `|chart:${customStrategy.showOnChart}` +
+      `|focused:${customStrategy.focused}`,
+    [customStrategy],
+  );
 
-  // ---- Focus zones: async, computed from indicator-tf candles. The zone
-  // bands behind the candles communicate the long/flat cadence on their own,
-  // so we deliberately drop the small green/red signal circles in focus mode
-  // — they would just clutter the already-coloured backdrop.
+  // ---- Strategy hints: async, computed per indicator on its OWN timeframe
+  // and projected onto chart bars. Used by both the showOnChart signal
+  // overlay and the focused zone shading — and updated together so the two
+  // never disagree about what the strategy says.
+  const [strategyHints, setStrategyHints] = useState<BarHint[]>([]);
+  useEffect(() => {
+    if (
+      customStrategy.indicators.length === 0 ||
+      candleCount === 0 ||
+      (!customStrategy.showOnChart && !customStrategy.focused)
+    ) {
+      setStrategyHints([]);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const hints = await computeCompositeHints({
+          chartCandles: useAppStore.getState().candleData,
+          indicators: customStrategy.indicators,
+          logic: customStrategy.logic,
+          symbol: selectedSymbol,
+          cryptoUniverse: new Set(allSymbols),
+        });
+        if (!cancelled) setStrategyHints(hints);
+      } catch (err) {
+        console.warn('Composite hint pipeline failed:', err);
+        if (!cancelled) setStrategyHints([]);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    candleCount,
+    lastCandleTime,
+    firstCandleTime,
+    strategyFingerprint,
+    selectedSymbol,
+    customStrategy.showOnChart,
+    customStrategy.focused,
+  ]);
+
+  // ---- Non-focus signals: synchronous indicator signals from chart-tf
+  // candles + composite strategy signals derived from the async hints.
+  const multiSignals: ChartSignal[] = useMemo(() => {
+    if (candleCount === 0) return [];
+    if (focusedIndicator || customStrategy.focused) return [];
+
+    const indicatorSignals =
+      enabledIndicators.length > 0
+        ? computeMultiIndicatorSignals(
+            candleData,
+            enabledIndicators,
+            defaultStrategyFor,
+            'long-short',
+          )
+        : [];
+
+    if (
+      !customStrategy.showOnChart ||
+      customStrategy.indicators.length === 0 ||
+      strategyHints.length === 0
+    ) {
+      return indicatorSignals;
+    }
+
+    const sourceType = customStrategy.indicators[0].type;
+    const strategySignals: ChartSignal[] = signalsFromHints(strategyHints).map(
+      (s) => ({ time: s.time, type: s.type, source: sourceType }),
+    );
+
+    // Merge by (time, type) so coincident indicator + strategy signals collapse
+    // to one circle rather than stacking on top of each other.
+    const merged = new Map<string, ChartSignal>();
+    for (const s of [...indicatorSignals, ...strategySignals]) {
+      const key = `${s.time}|${s.type}`;
+      if (!merged.has(key)) merged.set(key, s);
+    }
+    return Array.from(merged.values()).sort((a, b) => a.time - b.time);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    candleCount,
+    lastCandleTime,
+    indicatorsFingerprint,
+    focusFingerprint,
+    strategyFingerprint,
+    strategyHints,
+  ]);
+
+  // ---- Focus zones: async (for indicator focus, which fetches at the
+  // indicator's own timeframe) or synchronous (for strategy focus, which
+  // operates on the chart's existing candle data). The zone bands behind
+  // the candles communicate the long/short cadence on their own, so signal
+  // circles drop out in focus mode to keep the visual clean.
   const [focusOverlay, setFocusOverlay] = useState<{
     zones: CandlePosition[] | undefined;
   }>({ zones: undefined });
@@ -108,6 +207,21 @@ export default function ChartContainer({ indicatorValues }: Props) {
     );
     return () => clearInterval(id);
   }, [focusedIndicator]);
+
+  // Strategy-focused zones — derived from the async hint pipeline so each
+  // contributing indicator's own timeframe is honoured. A 1d chart with
+  // RSI(1h) AND BB(5m) gets correct zones, not "everything red" because the
+  // 1d-projection of RSI never went oversold simultaneously with BB.
+  const strategyZones: CandlePosition[] | undefined = useMemo(() => {
+    if (
+      !customStrategy.focused ||
+      customStrategy.indicators.length === 0 ||
+      strategyHints.length === 0
+    ) {
+      return undefined;
+    }
+    return zonesFromHints(strategyHints);
+  }, [customStrategy.focused, customStrategy.indicators.length, strategyHints]);
 
   useEffect(() => {
     if (!focusedIndicator || candleCount === 0) {
@@ -169,12 +283,19 @@ export default function ChartContainer({ indicatorValues }: Props) {
     refreshTick,
   ]);
 
-  // In focus mode, zones carry all the buy/sell context the user needs;
-  // signal circles would just visually compete with the coloured backdrop.
-  // Outside focus mode the multi-indicator circles still show because there
-  // are no zones there to take their place.
-  const signals = focusedIndicator ? [] : multiSignals;
-  const zones = focusedIndicator ? focusOverlay.zones : undefined;
+  // In focus mode (either indicator or strategy), zones carry all the
+  // buy/sell context the user needs; signal circles would just visually
+  // compete with the coloured backdrop. Outside focus mode the multi-
+  // indicator circles still show because there are no zones there to take
+  // their place. Strategy focus and indicator focus are mutually exclusive
+  // — the store guarantees at most one of them is set.
+  const inFocusMode = Boolean(focusedIndicator) || customStrategy.focused;
+  const signals = inFocusMode ? [] : multiSignals;
+  const zones = customStrategy.focused
+    ? strategyZones
+    : focusedIndicator
+      ? focusOverlay.zones
+      : undefined;
 
   // Resolve the current symbol's price precision. Binance pairs come from
   // exchangeInfo's `PRICE_FILTER.tickSize`; for Yahoo (stocks / commodities)
@@ -201,13 +322,25 @@ export default function ChartContainer({ indicatorValues }: Props) {
     );
   }
 
+  // Trade markers from the last backtest are only meaningful while the
+  // chart is showing the same symbol + timeframe they were computed on.
+  // Otherwise the trade timestamps wouldn't align with the candles on
+  // screen and the markers either disappear silently or land at the wrong
+  // place. Filter them out until a fresh run replaces them.
+  const tradesForCurrent =
+    lastBacktest &&
+    lastBacktest.symbol === selectedSymbol &&
+    lastBacktest.timeframe === timeframe
+      ? lastBacktest.trades
+      : undefined;
+
   return (
     <div className="h-full w-full">
       <Chart
         data={candleData}
         indicators={indicators}
         indicatorValues={indicatorValues}
-        trades={lastBacktest?.trades}
+        trades={tradesForCurrent}
         signals={showOverlays ? signals : []}
         zones={showOverlays ? zones : undefined}
         pricePrecision={pricePrecision}

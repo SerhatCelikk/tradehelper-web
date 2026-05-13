@@ -5,7 +5,6 @@ import { useState } from 'react';
 import Header from './components/Header';
 import WatchlistPanel from './components/WatchlistPanel';
 import IndicatorPerformancePanel from './components/IndicatorPerformancePanel';
-import BacktestPanel from './components/BacktestPanel';
 import AlertManager from './components/AlertManager';
 import DatabaseManager from './components/DatabaseManager';
 import { useAppStore } from './store/store';
@@ -26,7 +25,6 @@ const ChartContainer = dynamic(() => import('./components/ChartContainer'), {
 export default function HomePage() {
   const [alertModalOpen, setAlertModalOpen] = useState(false);
   const [dbModalOpen, setDbModalOpen] = useState(false);
-  const [showStrategyBuilder, setShowStrategyBuilder] = useState(false);
   const isMobileMenuOpen = useAppStore((s) => s.isMobileMenuOpen);
   const setMobileMenuOpen = useAppStore((s) => s.setMobileMenuOpen);
 
@@ -52,7 +50,11 @@ export default function HomePage() {
           <WatchlistPanel onSelect={() => setMobileMenuOpen(false)} />
         </aside>
 
-        {/* Center — chart on top, performance cards below */}
+        {/* Center — chart on top, tabbed indicator + strategy panel below.
+            The old right-side BacktestPanel was retired in favour of the
+            "My Strategy" tab in IndicatorPerformancePanel, which uses each
+            indicator's built-in buy/sell signal instead of asking the user
+            to hand-roll raw conditions. */}
         <section className="flex flex-1 flex-col min-w-0 overflow-hidden">
           <div className="flex-shrink-0 h-[55vh] min-h-[360px] max-h-[640px]">
             <ChartContainer indicatorValues={indicatorValues} />
@@ -62,46 +64,6 @@ export default function HomePage() {
             <IndicatorPerformancePanel />
           </div>
         </section>
-
-        {/* Right — collapsible custom strategy builder */}
-        <aside
-          className={`hidden lg:flex flex-col border-l border-border bg-background-secondary transition-all flex-shrink-0 ${
-            showStrategyBuilder ? 'w-80 xl:w-96' : 'w-12'
-          }`}
-        >
-          <button
-            className="border-b border-border px-3 py-2.5 text-xs uppercase tracking-wide text-foreground-muted hover:text-foreground hover:bg-background-tertiary text-left flex items-center justify-between gap-2"
-            onClick={() => setShowStrategyBuilder(!showStrategyBuilder)}
-            title={
-              showStrategyBuilder
-                ? 'Collapse strategy builder'
-                : 'Open custom strategy builder'
-            }
-          >
-            {showStrategyBuilder ? (
-              <>
-                <span>Custom Strategy</span>
-                <span aria-hidden>›</span>
-              </>
-            ) : (
-              <span
-                className="block whitespace-nowrap"
-                style={{
-                  writingMode: 'vertical-rl',
-                  transform: 'rotate(180deg)',
-                }}
-              >
-                Custom Strategy
-              </span>
-            )}
-          </button>
-
-          {showStrategyBuilder && (
-            <div className="flex-1 overflow-y-auto p-3">
-              <BacktestPanel />
-            </div>
-          )}
-        </aside>
       </main>
 
       <ConnectionStatus />

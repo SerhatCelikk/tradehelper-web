@@ -144,6 +144,31 @@ interface AppState {
   // Indicators
   indicators: IndicatorConfig[];
 
+  /**
+   * User-composed strategy: a list of indicators (each contributing its own
+   * default buy/sell signal) plus a global AND/OR connective. Driven by the
+   * "My Strategy" tab below the chart — the user adds indicators with a +
+   * button on each performance card, picks ALL vs ANY, then hits Run.
+   */
+  customStrategy: {
+    indicators: IndicatorConfig[];
+    logic: 'AND' | 'OR';
+    /**
+     * When true, the composite strategy's BUY/SELL signal circles render on
+     * the chart alongside the enabled-indicator signals. Independent of
+     * `focused` — you can have signals without zones or zones without
+     * signals.
+     */
+    showOnChart: boolean;
+    /**
+     * When true, the strategy takes over zone shading (green long / red
+     * short) on the chart, overriding any focused indicator. Mutually
+     * exclusive with `focusedIndicatorId` — toggling this on clears that
+     * and vice versa.
+     */
+    focused: boolean;
+  };
+
   // Backtest
   lastBacktest: BacktestResult | null;
   isBacktestRunning: boolean;
@@ -206,6 +231,14 @@ interface AppState {
     timeframe: IndicatorConfig['timeframe'],
   ) => string;
 
+  /** Add (or replace) an indicator slot in the user's custom strategy. */
+  addToCustomStrategy: (cfg: IndicatorConfig) => void;
+  removeFromCustomStrategy: (type: IndicatorConfig['type']) => void;
+  setCustomStrategyLogic: (logic: 'AND' | 'OR') => void;
+  setCustomStrategyShowOnChart: (show: boolean) => void;
+  setCustomStrategyFocused: (focused: boolean) => void;
+  clearCustomStrategy: () => void;
+
   setLastBacktest: (r: BacktestResult | null) => void;
   setBacktestRunning: (b: boolean) => void;
   setShowBacktestPanel: (b: boolean) => void;
@@ -230,6 +263,7 @@ const persistKeys = {
   timeframe: 'th_timeframe',
   indicators: 'th_indicators',
   collapsedSections: 'th_sections_collapsed',
+  customStrategy: 'th_custom_strategy',
 };
 
 const DEFAULT_COLLAPSED: Record<MarketCategory, boolean> = {
@@ -284,6 +318,13 @@ export const useAppStore = create<AppState>((set, get) => ({
   isLoadingHistory: false,
 
   indicators: DEFAULT_INDICATORS,
+
+  customStrategy: {
+    indicators: [],
+    logic: 'AND' as const,
+    showOnChart: false,
+    focused: false,
+  },
 
   lastBacktest: null,
   isBacktestRunning: false,
@@ -348,7 +389,17 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({ collapsedSections: next });
     savePersisted(persistKeys.collapsedSections, next);
   },
-  setFocusedIndicator: (id) => set({ focusedIndicatorId: id }),
+  setFocusedIndicator: (id) => {
+    // Focusing an indicator displaces strategy focus (and vice versa in
+    // `setCustomStrategyFocused`).
+    if (id !== null && get().customStrategy.focused) {
+      const next = { ...get().customStrategy, focused: false };
+      set({ focusedIndicatorId: id, customStrategy: next });
+      savePersisted(persistKeys.customStrategy, next);
+    } else {
+      set({ focusedIndicatorId: id });
+    }
+  },
 
   setCandleData: (c) => set({ candleData: c }),
   appendCandle: (c) => {
@@ -435,6 +486,65 @@ export const useAppStore = create<AppState>((set, get) => ({
     return cfg.id;
   },
 
+  addToCustomStrategy: (cfg) => {
+    // One slot per indicator type — re-adding RSI with different params
+    // overwrites the previous slot rather than stacking two RSI rows.
+    const current = get().customStrategy;
+    const filtered = current.indicators.filter((i) => i.type !== cfg.type);
+    const snapshot: IndicatorConfig = {
+      ...cfg,
+      enabled: true,
+      params: { ...cfg.params },
+    };
+    const next = { ...current, indicators: [...filtered, snapshot] };
+    set({ customStrategy: next });
+    savePersisted(persistKeys.customStrategy, next);
+  },
+  removeFromCustomStrategy: (type) => {
+    const current = get().customStrategy;
+    const next = {
+      ...current,
+      indicators: current.indicators.filter((i) => i.type !== type),
+    };
+    set({ customStrategy: next });
+    savePersisted(persistKeys.customStrategy, next);
+  },
+  setCustomStrategyLogic: (logic) => {
+    const next = { ...get().customStrategy, logic };
+    set({ customStrategy: next });
+    savePersisted(persistKeys.customStrategy, next);
+  },
+  setCustomStrategyShowOnChart: (showOnChart) => {
+    const next = { ...get().customStrategy, showOnChart };
+    set({ customStrategy: next });
+    savePersisted(persistKeys.customStrategy, next);
+  },
+  setCustomStrategyFocused: (focused) => {
+    const next = { ...get().customStrategy, focused };
+    // Focusing the strategy displaces any indicator focus — only one thing
+    // can own the chart's zone shading at a time, and trying to coexist
+    // would just produce noise.
+    if (focused) {
+      set({ customStrategy: next, focusedIndicatorId: null });
+    } else {
+      set({ customStrategy: next });
+    }
+    savePersisted(persistKeys.customStrategy, next);
+  },
+  clearCustomStrategy: () => {
+    const next = {
+      indicators: [],
+      logic: 'AND' as const,
+      showOnChart: false,
+      focused: false,
+    };
+    // Drop the last backtest result too — it was computed for the now-
+    // cleared strategy and would otherwise leave orphaned trade markers
+    // floating on the chart.
+    set({ customStrategy: next, lastBacktest: null });
+    savePersisted(persistKeys.customStrategy, next);
+  },
+
   setLastBacktest: (r) => set({ lastBacktest: r }),
   setBacktestRunning: (b) => set({ isBacktestRunning: b }),
   setShowBacktestPanel: (b) => set({ showBacktestPanel: b }),
@@ -510,6 +620,47 @@ export function hydrateStoreFromStorage() {
   if (collapsed && typeof collapsed === 'object') {
     useAppStore.setState({
       collapsedSections: { ...DEFAULT_COLLAPSED, ...collapsed },
+    });
+  }
+
+  const customStrategyRaw = loadPersisted<unknown>(persistKeys.customStrategy, null);
+  if (
+    customStrategyRaw &&
+    typeof customStrategyRaw === 'object' &&
+    Array.isArray((customStrategyRaw as { indicators?: unknown }).indicators)
+  ) {
+    const cs = customStrategyRaw as {
+      indicators: unknown[];
+      logic?: 'AND' | 'OR';
+    };
+    const migrated: IndicatorConfig[] = [];
+    for (const raw of cs.indicators) {
+      if (!raw || typeof raw !== 'object') continue;
+      const r = raw as Partial<IndicatorConfig> & { type?: string };
+      if (!r.type) continue;
+      const def = defaultConfigForType(r.type as IndicatorConfig['type']);
+      migrated.push({
+        ...def,
+        ...r,
+        id: r.id ?? def.id,
+        type: (r.type as IndicatorConfig['type']) ?? def.type,
+        enabled: true,
+        color: r.color ?? def.color,
+        params: { ...def.params, ...(r.params ?? {}) },
+        timeframe: r.timeframe ?? def.timeframe,
+      });
+    }
+    const csTyped = cs as typeof cs & {
+      showOnChart?: boolean;
+      focused?: boolean;
+    };
+    useAppStore.setState({
+      customStrategy: {
+        indicators: migrated,
+        logic: cs.logic === 'OR' ? 'OR' : 'AND',
+        showOnChart: csTyped.showOnChart === true,
+        focused: csTyped.focused === true,
+      },
     });
   }
 }

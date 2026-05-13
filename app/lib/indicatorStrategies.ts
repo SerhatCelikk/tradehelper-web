@@ -23,6 +23,220 @@ function cid(): string {
   return `c${Date.now().toString(36)}-${counter}`;
 }
 
+/**
+ * State-based buy/sell predicates per indicator. Whereas `defaultStrategyFor`
+ * fires on cross *events* (the bar the indicator first crosses a threshold),
+ * these return "is the indicator currently in a long-favourable / short-
+ * favourable state?" predicates. That's the only shape that makes the AND
+ * combinator in the composite strategy meaningful — two cross events almost
+ * never land on the exact same bar, so AND-of-crosses degenerates to "never
+ * fires". State-of-X AND state-of-Y vs. state-of-X OR state-of-Y both
+ * produce reasonable trade cadence.
+ */
+function stateConditionsFor(ind: IndicatorConfig): {
+  buy: StrategyCondition[];
+  sell: StrategyCondition[];
+} {
+  switch (ind.type) {
+    case 'RSI': {
+      const oversold = ind.params.oversold ?? 30;
+      const overbought = ind.params.overbought ?? 70;
+      return {
+        buy: [
+          {
+            id: cid(),
+            indicator: 'RSI',
+            operator: '<',
+            value: oversold,
+            valueType: 'number',
+          },
+        ],
+        sell: [
+          {
+            id: cid(),
+            indicator: 'RSI',
+            operator: '>',
+            value: overbought,
+            valueType: 'number',
+          },
+        ],
+      };
+    }
+    case 'MACD': {
+      const mode = ind.params.macdMode ?? 'signal_cross';
+      if (mode === 'signal_cross') {
+        return {
+          buy: [
+            {
+              id: cid(),
+              indicator: 'MACD',
+              param: 'macd',
+              operator: '>',
+              value: 'MACD',
+              valueType: 'indicator',
+              valueParam: 'signal',
+            },
+          ],
+          sell: [
+            {
+              id: cid(),
+              indicator: 'MACD',
+              param: 'macd',
+              operator: '<',
+              value: 'MACD',
+              valueType: 'indicator',
+              valueParam: 'signal',
+            },
+          ],
+        };
+      }
+      if (mode === 'zero_cross') {
+        return {
+          buy: [
+            {
+              id: cid(),
+              indicator: 'MACD',
+              param: 'macd',
+              operator: '>',
+              value: 0,
+              valueType: 'number',
+            },
+          ],
+          sell: [
+            {
+              id: cid(),
+              indicator: 'MACD',
+              param: 'macd',
+              operator: '<',
+              value: 0,
+              valueType: 'number',
+            },
+          ],
+        };
+      }
+      // histogram_sign
+      return {
+        buy: [
+          {
+            id: cid(),
+            indicator: 'MACD',
+            param: 'histogram',
+            operator: '>',
+            value: 0,
+            valueType: 'number',
+          },
+        ],
+        sell: [
+          {
+            id: cid(),
+            indicator: 'MACD',
+            param: 'histogram',
+            operator: '<',
+            value: 0,
+            valueType: 'number',
+          },
+        ],
+      };
+    }
+    case 'BBANDS': {
+      const mode = ind.params.bbandsMode ?? 'mean_reversion';
+      if (mode === 'mean_reversion') {
+        return {
+          buy: [
+            {
+              id: cid(),
+              indicator: 'PRICE',
+              operator: '<',
+              value: 'BBANDS',
+              valueType: 'indicator',
+              valueParam: 'lower',
+            },
+          ],
+          sell: [
+            {
+              id: cid(),
+              indicator: 'PRICE',
+              operator: '>',
+              value: 'BBANDS',
+              valueType: 'indicator',
+              valueParam: 'upper',
+            },
+          ],
+        };
+      }
+      // breakout
+      return {
+        buy: [
+          {
+            id: cid(),
+            indicator: 'PRICE',
+            operator: '>',
+            value: 'BBANDS',
+            valueType: 'indicator',
+            valueParam: 'upper',
+          },
+        ],
+        sell: [
+          {
+            id: cid(),
+            indicator: 'PRICE',
+            operator: '<',
+            value: 'BBANDS',
+            valueType: 'indicator',
+            valueParam: 'lower',
+          },
+        ],
+      };
+    }
+    case 'SMA':
+    case 'EMA': {
+      const ref = ind.type;
+      return {
+        buy: [
+          {
+            id: cid(),
+            indicator: 'PRICE',
+            operator: '>',
+            value: ref,
+            valueType: 'indicator',
+          },
+        ],
+        sell: [
+          {
+            id: cid(),
+            indicator: 'PRICE',
+            operator: '<',
+            value: ref,
+            valueType: 'indicator',
+          },
+        ],
+      };
+    }
+  }
+}
+
+/**
+ * Merge multiple indicators into one composite strategy with a shared
+ * AND/OR connective. Uses state-based predicates per indicator (see
+ * `stateConditionsFor`) — not the cross-event predicates `defaultStrategyFor`
+ * uses for single-indicator backtests — so the AND combinator actually
+ * produces trades instead of waiting for two cross events to align on
+ * exactly the same bar.
+ */
+export function composeStrategy(
+  indicators: IndicatorConfig[],
+  logic: 'AND' | 'OR',
+): Strategy {
+  const states = indicators.map((ind) => stateConditionsFor(ind));
+  return {
+    name: `Custom (${indicators.map((i) => i.type).join('+')})`,
+    indicators: indicators.map((i) => ({ ...i, enabled: true })),
+    buyConditions: states.flatMap((s) => s.buy),
+    sellConditions: states.flatMap((s) => s.sell),
+    logic,
+  };
+}
+
 export function defaultStrategyFor(ind: IndicatorConfig): Strategy {
   const indCopy: IndicatorConfig = { ...ind, enabled: true };
 
