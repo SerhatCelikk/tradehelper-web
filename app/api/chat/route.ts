@@ -5,9 +5,25 @@ export const runtime = 'nodejs';
 const MODEL = 'gemini-flash-latest';
 const ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`;
 
-interface ChatMessage {
-  role: 'user' | 'assistant';
-  content: string;
+/* -------------------------------------------------------------------------- */
+/*                          Wire types (client ↔ server)                      */
+/* -------------------------------------------------------------------------- */
+
+interface APIMessage {
+  role: 'user' | 'assistant' | 'assistant_tool' | 'tool';
+  /** For role 'user' | 'assistant'. */
+  content?: string;
+  /** For role 'assistant_tool' (the model called a function last turn) and
+   *  for role 'tool' (the client-executed function result). */
+  name?: string;
+  args?: Record<string, unknown>;
+  response?: unknown;
+  /** Provenance token Gemini attaches to its own functionCall parts. We
+   *  must echo it back unchanged when the function call appears in the
+   *  history we send next — newer Gemini API versions reject the request
+   *  with a 400 if it's missing. See:
+   *  https://ai.google.dev/gemini-api/docs/thought-signatures */
+  thoughtSignature?: string;
 }
 
 interface IndicatorContext {
@@ -39,12 +55,84 @@ interface ChatContext {
   };
   optimizerHints?: OptimizerHint[];
   knownSymbols?: string[];
+  /** Which horizons have a saved optimizer run for this symbol+timeframe.
+   *  Lets the assistant tell the user "I already have a daily run cached"
+   *  vs "you'll need to optimize first". */
+  availableOptimizerHorizons?: string[];
 }
 
 interface ChatRequest {
-  messages: ChatMessage[];
+  messages: APIMessage[];
   context?: ChatContext;
 }
+
+/* -------------------------------------------------------------------------- */
+/*                              Tool declarations                             */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Gemini-side function declarations. The model decides whether to call
+ * these based on the user's wording; we surface the call to the client,
+ * which executes it against the app state and posts the result back.
+ */
+const TOOL_FUNCTIONS = {
+  functionDeclarations: [
+    {
+      name: 'applyBestSettingsForHorizon',
+      description:
+        "Apply the user's saved optimizer top-per-indicator settings " +
+        '(RSI, MACD, BBANDS, SMA, EMA — one of each type) onto the ' +
+        "Indicators panel for the user's current symbol+timeframe at the " +
+        'chosen horizon. The indicator performance cards (Daily/Weekly/' +
+        'Monthly) auto-recompute after this runs. Use when the user asks ' +
+        'something like "apply the best daily indicator settings", ' +
+        '"haftalık en iyi ayarları getir", "günün en iyi indikatörlerini ' +
+        'kur ve hesapla", or any phrasing that means "make the page reflect ' +
+        'the optimizer\'s best settings for that horizon". If no saved ' +
+        'optimizer run exists for this combo the tool will return an error — ' +
+        "you can then call `runOptimizerForHorizon` to generate one and " +
+        'chain back into this tool to apply it.',
+      parameters: {
+        type: 'OBJECT',
+        properties: {
+          horizon: {
+            type: 'STRING',
+            enum: ['daily', 'weekly', 'monthly', 'yearly'],
+            description:
+              'Which horizon to load the optimizer\'s best settings from.',
+          },
+        },
+        required: ['horizon'],
+      },
+    },
+    {
+      name: 'runOptimizerForHorizon',
+      description:
+        'Run the parameter optimizer for the user\'s current symbol+' +
+        'timeframe at the given horizon and SAVE the results. Takes 15-30 ' +
+        'seconds. Call this when (a) `applyBestSettingsForHorizon` failed ' +
+        'because no saved run exists yet, or (b) the user explicitly asks ' +
+        'to "re-scan / re-run / optimize / tara / optimize et" the indicators. ' +
+        'IMPORTANT: tell the user up front that the scan will take 15-30s ' +
+        'before invoking this. After the optimizer finishes you should ' +
+        'usually chain into `applyBestSettingsForHorizon` to put the new ' +
+        'winners onto the page — unless the user only asked for a list.',
+      parameters: {
+        type: 'OBJECT',
+        properties: {
+          horizon: {
+            type: 'STRING',
+            enum: ['daily', 'weekly', 'monthly', 'yearly'],
+            description:
+              'Which horizon to optimize for. Test window covers the last ' +
+              '1 / 7 / 30 / 365 days respectively.',
+          },
+        },
+        required: ['horizon'],
+      },
+    },
+  ],
+};
 
 /* -------------------------------------------------------------------------- */
 /*                              System prompt                                 */
@@ -60,16 +148,24 @@ function buildSystemInstruction(ctx: ChatContext | undefined): string {
     '- Use Markdown sparingly: short paragraphs, occasional bullet lists, **bold** for key numbers and tickers.',
     '- Tickers in messages start with `@` — `@BTCUSDT` is crypto (Binance pair), `@AAPL` is a US stock, `@GC=F` is a commodity future (gold). Resolve them when answering.',
     '',
-    '## News and current events — IMPORTANT',
-    '- Your training data is months to years out of date. **Never** answer a "what\'s happening with X?" / "any news?" question from memory.',
+    '## Actions (function calling)',
+    '- You have two available tools:',
+    '  - `applyBestSettingsForHorizon(horizon)` — applies the SAVED optimizer\'s top setting for each indicator type (RSI, MACD, BBANDS, SMA, EMA) onto the user\'s current symbol+timeframe at the requested horizon. The performance cards auto-recompute afterwards. Instant.',
+    '  - `runOptimizerForHorizon(horizon)` — runs the optimizer over the user\'s current symbol+timeframe and saves the result. **Takes 15-30 seconds.** Tell the user it\'ll take a moment before calling.',
+    '- **Call these tools whenever the user asks to "apply / set up / kur / getir / uygula / hesapla / optimize et" the best settings for a horizon** (daily / weekly / monthly / yearly). Do not just describe the settings — actually invoke the tool so the page changes.',
+    '- **Chaining pattern**: if `applyBestSettingsForHorizon` returns an error like "No saved optimizer run", do not give up. Tell the user "I\'ll run the optimizer first — this takes about 30 seconds", then call `runOptimizerForHorizon(horizon)`, and once it succeeds chain back into `applyBestSettingsForHorizon(horizon)` to push the new winners onto the page. Finally summarise in one short paragraph.',
+    '- Each tool returns the list of applied/found indicators with their realised returns. After success, briefly summarise in plain language (no need to dump every parameter).',
+    '- If the user only wants to *see* the best settings (not apply), you can still call `runOptimizerForHorizon` to get fresh numbers and then describe the results instead of chaining into apply.',
+    '',
+    '## News and current events',
+    '- Your training data is months to years out of date. **Never** answer "what\'s happening with X?" / "any news?" from memory.',
     '- **Always** invoke Google Search for any question about prices, news, events, sentiment, regulation, earnings, hacks, listings, partnerships, or anything time-sensitive.',
-    `- Prioritise sources from the **last 24–72 hours**, ideally within the last few hours for breaking developments. Today is ${today}.`,
-    '- Cite the **date** (or "today", "yesterday", "X hours ago") in your answer so the user can judge freshness. If your top sources are older than 7 days, say so explicitly and explain you couldn\'t find more recent material.',
-    '- Mention 2–4 distinct headlines/angles instead of one block of paraphrase, and only cite items you actually retrieved.',
+    `- Prioritise sources from the **last 24–72 hours**. Today is ${today}. Cite the date (or "today", "yesterday", "X hours ago") so the user can judge freshness.`,
+    '- Mention 2–4 distinct headlines/angles instead of one block of paraphrase. Only cite items you actually retrieved.',
     '',
     '## Strategy advice',
     '- Reference the user\'s configured indicators and recent optimizer findings when they\'re relevant — name the indicator, its parameters, and the realised return.',
-    '- Tell the user *how* to use specific indicators for specific horizons. Example: "For monthly return on @BTCUSDT the optimizer found **RSI(14, 25, 75)** at +12.4% on test — apply it from the Indicators tab and toggle focus mode to see the long/short zones."',
+    '- Tell the user *how* to use specific indicators for specific horizons. Example: "For monthly return on @BTCUSDT the optimizer found **RSI(14, 25, 75)** at +12.4% on test — want me to apply it? (I can.)"',
     '- Never invent prices, trades, or news. If you don\'t know, say so.',
     '',
   ];
@@ -100,15 +196,19 @@ function buildSystemInstruction(ctx: ChatContext | undefined): string {
     }
   }
 
-  if (
-    ctx.customStrategy &&
-    ctx.customStrategy.indicators.length > 0
-  ) {
+  if (ctx.customStrategy && ctx.customStrategy.indicators.length > 0) {
     const parts = ctx.customStrategy.indicators
       .map((i) => `${i.type}@${i.timeframe}`)
       .join(' + ');
+    lines.push(`- Custom "My Strategy" (${ctx.customStrategy.logic}): ${parts}`);
+  }
+
+  if (
+    ctx.availableOptimizerHorizons &&
+    ctx.availableOptimizerHorizons.length > 0
+  ) {
     lines.push(
-      `- Custom "My Strategy" (${ctx.customStrategy.logic}): ${parts}`,
+      `- Saved optimizer runs available for: ${ctx.availableOptimizerHorizons.join(', ')}`,
     );
   }
 
@@ -127,6 +227,52 @@ function buildSystemInstruction(ctx: ChatContext | undefined): string {
 /* -------------------------------------------------------------------------- */
 /*                              Gemini request                                */
 /* -------------------------------------------------------------------------- */
+
+interface GeminiContent {
+  role: 'user' | 'model' | 'function';
+  parts: GeminiPart[];
+}
+
+interface GeminiPart {
+  text?: string;
+  functionCall?: { name: string; args: Record<string, unknown> };
+  functionResponse?: { name: string; response: unknown };
+  /** Opaque provenance token for thought-step ↔ function-call binding. */
+  thoughtSignature?: string;
+}
+
+function buildContents(messages: APIMessage[]): GeminiContent[] {
+  return messages.map((m): GeminiContent => {
+    switch (m.role) {
+      case 'user':
+        return { role: 'user', parts: [{ text: m.content ?? '' }] };
+      case 'assistant':
+        return { role: 'model', parts: [{ text: m.content ?? '' }] };
+      case 'assistant_tool': {
+        const part: GeminiPart = {
+          functionCall: { name: m.name ?? '', args: m.args ?? {} },
+        };
+        // Echo the original thought signature back so Gemini accepts the
+        // history. Omitting it triggers a 400 with the docs link in the
+        // error body.
+        if (m.thoughtSignature) part.thoughtSignature = m.thoughtSignature;
+        return { role: 'model', parts: [part] };
+      }
+      case 'tool':
+        return {
+          role: 'function',
+          parts: [
+            {
+              functionResponse: {
+                name: m.name ?? '',
+                response: m.response ?? {},
+              },
+            },
+          ],
+        };
+    }
+  });
+}
 
 export async function POST(req: Request) {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -154,140 +300,144 @@ export async function POST(req: Request) {
   }
 
   const systemText = buildSystemInstruction(body.context);
-  const contents = body.messages.map((m) => ({
-    role: m.role === 'user' ? 'user' : 'model',
-    parts: [{ text: m.content }],
-  }));
+  const contents = buildContents(body.messages);
 
-  // Two-pass strategy: first attempt enables Google Search grounding so the
-  // assistant can answer "what's the news on $X today?" with real sources.
-  // If the model rejects the tool (some endpoints / regions / model versions
-  // refuse), retry without the tool — better degraded answer than 500.
+  // Tools strategy: try with BOTH Google Search and function declarations.
+  // Some Gemini setups reject the combination, in which case the retry uses
+  // just function declarations (actions matter more here than fresh search
+  // — and search-only news answers can use a separate non-tool path).
   const baseBody = {
     systemInstruction: systemText ? { parts: [{ text: systemText }] } : undefined,
     contents,
     generationConfig: {
       temperature: 0.7,
-      // Bumped from 1024 — long answers (news round-ups with sources +
-      // strategy explanations) were getting truncated mid-sentence on the
-      // smaller cap.
       maxOutputTokens: 8192,
     },
   };
 
-  // Gemini's v1beta REST surface expects camelCase tool keys (the curl
-  // examples in older docs use snake_case but the actual API silently
-  // ignores unknown tool keys, falling back to ungrounded responses
-  // sourced from stale training data — which is why news answers were
-  // years out of date until we fixed this).
-  const withTools = {
+  const fullTools = {
     ...baseBody,
-    tools: [{ googleSearch: {} }],
+    tools: [{ googleSearch: {} }, TOOL_FUNCTIONS],
+  };
+  const functionsOnly = {
+    ...baseBody,
+    tools: [TOOL_FUNCTIONS],
   };
 
-  let resp: Response;
-  try {
-    resp = await fetch(ENDPOINT, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-goog-api-key': apiKey,
-      },
-      body: JSON.stringify(withTools),
-    });
-  } catch (err) {
-    return NextResponse.json(
-      { error: `Network error reaching Gemini: ${String(err)}` },
-      { status: 502 },
-    );
-  }
+  let data: GeminiResponse | null = null;
+  let lastError = '';
 
-  if (!resp.ok) {
-    // Retry without tools if the tool block is the cause.
+  for (const variant of [fullTools, functionsOnly, baseBody]) {
     try {
-      const retry = await fetch(ENDPOINT, {
+      const resp = await fetch(ENDPOINT, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'X-goog-api-key': apiKey,
         },
-        body: JSON.stringify(baseBody),
+        body: JSON.stringify(variant),
       });
-      if (retry.ok) {
-        const data = await retry.json();
-        return NextResponse.json({
-          reply: extractReply(data),
-          grounding: null,
-          model: MODEL,
-        });
+      if (resp.ok) {
+        data = (await resp.json()) as GeminiResponse;
+        break;
       }
-      const text = await retry.text();
-      return NextResponse.json(
-        { error: `Gemini ${retry.status}: ${truncate(text, 400)}` },
-        { status: 502 },
-      );
+      lastError = `Gemini ${resp.status}: ${truncate(await resp.text(), 400)}`;
     } catch (err) {
-      return NextResponse.json(
-        { error: `Gemini call failed: ${String(err)}` },
-        { status: 502 },
-      );
+      lastError = `Network error: ${String(err)}`;
     }
   }
 
-  const data = await resp.json();
-  return NextResponse.json({
-    reply: extractReply(data),
-    grounding: extractGroundingSummary(data),
-    model: MODEL,
-  });
+  if (!data) {
+    return NextResponse.json({ error: lastError || 'Gemini call failed' }, { status: 502 });
+  }
+
+  return NextResponse.json(extractResponse(data));
 }
 
 /* -------------------------------------------------------------------------- */
-/*                                Helpers                                     */
+/*                              Response parsing                              */
 /* -------------------------------------------------------------------------- */
 
 interface GeminiResponse {
   candidates?: Array<{
-    content?: {
-      parts?: Array<{ text?: string }>;
-    };
+    content?: { parts?: GeminiPart[] };
+    finishReason?: string;
     groundingMetadata?: {
       webSearchQueries?: string[];
-      groundingChunks?: Array<{
-        web?: { uri?: string; title?: string };
-      }>;
+      groundingChunks?: Array<{ web?: { uri?: string; title?: string } }>;
     };
   }>;
 }
 
-function extractReply(data: GeminiResponse): string {
-  try {
-    const parts = data.candidates?.[0]?.content?.parts;
-    if (!parts) return '';
-    return parts.map((p) => p.text ?? '').join('').trim();
-  } catch {
-    return '';
+interface ExtractedResponse {
+  toolCall: {
+    name: string;
+    args: Record<string, unknown>;
+    /** Carry the signature through so the client can echo it back on the
+     *  follow-up request after executing the tool. */
+    thoughtSignature?: string;
+  } | null;
+  reply: string;
+  grounding: {
+    queries: string[];
+    sources: Array<{ title: string; uri: string }>;
+  } | null;
+  finishReason: string | null;
+  model: string;
+}
+
+function extractResponse(data: GeminiResponse): ExtractedResponse {
+  const candidate = data.candidates?.[0];
+  const parts = candidate?.content?.parts ?? [];
+
+  // Prefer function call when both are present — the model is telling us
+  // "first execute this, then I'll wrap up with text on the next turn".
+  const fcPart = parts.find((p) => p.functionCall);
+  if (fcPart?.functionCall) {
+    return {
+      toolCall: {
+        name: fcPart.functionCall.name,
+        args: fcPart.functionCall.args ?? {},
+        thoughtSignature: fcPart.thoughtSignature,
+      },
+      reply: parts
+        .filter((p) => p.text)
+        .map((p) => p.text ?? '')
+        .join('')
+        .trim(),
+      grounding: extractGroundingSummary(candidate),
+      finishReason: candidate?.finishReason ?? null,
+      model: MODEL,
+    };
   }
+
+  const text = parts
+    .map((p) => p.text ?? '')
+    .join('')
+    .trim();
+  return {
+    toolCall: null,
+    reply: text,
+    grounding: extractGroundingSummary(candidate),
+    finishReason: candidate?.finishReason ?? null,
+    model: MODEL,
+  };
 }
 
-interface GroundingSummary {
-  queries: string[];
-  sources: Array<{ title: string; uri: string }>;
-}
+type GeminiCandidate = NonNullable<GeminiResponse['candidates']>[number];
 
-function extractGroundingSummary(data: GeminiResponse): GroundingSummary | null {
+function extractGroundingSummary(
+  candidate: GeminiCandidate | undefined,
+): ExtractedResponse['grounding'] {
   try {
-    const meta = data.candidates?.[0]?.groundingMetadata;
+    const meta = candidate?.groundingMetadata;
     if (!meta) return null;
     const queries = meta.webSearchQueries ?? [];
     const sources: Array<{ title: string; uri: string }> = [];
     for (const c of meta.groundingChunks ?? []) {
       const web = c.web;
       if (web?.uri) {
-        sources.push({
-          title: web.title ?? web.uri,
-          uri: web.uri,
-        });
+        sources.push({ title: web.title ?? web.uri, uri: web.uri });
       }
     }
     if (queries.length === 0 && sources.length === 0) return null;

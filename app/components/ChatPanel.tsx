@@ -52,6 +52,7 @@ export default function ChatPanel() {
     sessions,
     active,
     isStreaming,
+    status,
     error,
     selectSession,
     createSession,
@@ -67,10 +68,12 @@ export default function ChatPanel() {
     const cryptoUniverse = new Set(allSymbols);
     const assetClass = classifySymbol(symbol, cryptoUniverse);
     const optimizerHints: ChatContext['optimizerHints'] = [];
+    const availableHorizons: string[] = [];
     if (typeof window !== 'undefined') {
       for (const h of HORIZONS) {
         const saved: SavedOptimization | null = loadOptimization(symbol, timeframe, h);
         if (!saved) continue;
+        availableHorizons.push(h);
         // Take the best of each indicator type so the assistant can suggest
         // "for monthly try MACD(...)" without us blasting it with every
         // candidate the optimizer touched.
@@ -112,6 +115,8 @@ export default function ChatPanel() {
             }
           : undefined,
       optimizerHints: optimizerHints.length > 0 ? optimizerHints : undefined,
+      availableOptimizerHorizons:
+        availableHorizons.length > 0 ? availableHorizons : undefined,
       knownSymbols: [...allSymbols.slice(0, 60), ...stockSymbols, ...commoditySymbols],
     };
   }, [
@@ -341,7 +346,9 @@ export default function ChatPanel() {
                 style={{ animationDelay: '240ms' }}
               />
             </span>
-            <span>thinking…</span>
+            <span className="text-foreground/80">
+              {status ?? 'thinking…'}
+            </span>
           </div>
         )}
       </div>

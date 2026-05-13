@@ -1,6 +1,13 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { useAppStore } from '../store/store';
+import {
+  executeChatTool,
+  toolStatusLabel,
+  type ToolCall,
+  type ToolExecutionContext,
+} from '../lib/chatTools';
 import {
   deriveSessionTitle,
   loadActiveSessionId,
@@ -41,12 +48,14 @@ export interface ChatContext {
     winRate: number;
   }>;
   knownSymbols?: string[];
+  availableOptimizerHorizons?: string[];
 }
 
 export interface UseChatReturn {
   sessions: ChatSession[];
   active: ChatSession | null;
   isStreaming: boolean;
+  status: string | null;
   error: string | null;
   selectSession: (id: string) => void;
   createSession: () => void;
@@ -55,18 +64,62 @@ export interface UseChatReturn {
   clearError: () => void;
 }
 
-/** Trim conversation history to the most recent N turns before sending to
- *  the model. Gemini Flash has plenty of room but past ~20 turns the older
- *  context is rarely load-bearing and the token bill grows unnecessarily. */
+/* -------------------------------------------------------------------------- */
+/*                              Internal types                                */
+/* -------------------------------------------------------------------------- */
+
+/** In-flight message format used to talk to /api/chat. Mirrors the
+ *  server's discriminated union — `assistant_tool` and `tool` entries are
+ *  the model's function call + the client-executed result respectively. */
+type APIMessage =
+  | { role: 'user'; content: string }
+  | { role: 'assistant'; content: string }
+  | {
+      role: 'assistant_tool';
+      name: string;
+      args: Record<string, unknown>;
+      /** Round-tripped from the previous Gemini response — required by
+       *  newer Gemini versions when a functionCall part appears in the
+       *  history we send back. */
+      thoughtSignature?: string;
+    }
+  | { role: 'tool'; name: string; response: unknown };
+
+interface APIResponse {
+  toolCall: {
+    name: string;
+    args: Record<string, unknown>;
+    thoughtSignature?: string;
+  } | null;
+  reply: string;
+  grounding: ChatMessage['grounding'];
+  finishReason: string | null;
+}
+
 const HISTORY_WINDOW = 20;
+// 4 rounds lets the model chain run-optimizer → apply-best-settings → wrap-up
+// without bumping the cap mid-conversation. The optimizer round itself is
+// ~15-30s, so we don't want chains to grow unboundedly either.
+const MAX_TOOL_ROUNDS = 4;
+
+/* -------------------------------------------------------------------------- */
+/*                                   Hook                                     */
+/* -------------------------------------------------------------------------- */
 
 export function useChat(): UseChatReturn {
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [isStreaming, setIsStreaming] = useState(false);
+  const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  // First-paint hydrate from localStorage.
+  // Store actions used by the tool executor.
+  const selectedSymbol = useAppStore((s) => s.selectedSymbol);
+  const timeframe = useAppStore((s) => s.timeframe);
+  const replaceOrAddIndicator = useAppStore((s) => s.replaceOrAddIndicator);
+  const allSymbols = useAppStore((s) => s.allSymbols);
+
+  // Hydrate once.
   const hydratedRef = useRef(false);
   useEffect(() => {
     if (hydratedRef.current) return;
@@ -81,8 +134,6 @@ export function useChat(): UseChatReturn {
     }
   }, []);
 
-  // Persist whenever sessions change after hydration. Skipping on the
-  // pre-hydration empty render avoids stomping the saved data with `[]`.
   useEffect(() => {
     if (!hydratedRef.current) return;
     saveSessions(sessions);
@@ -110,8 +161,6 @@ export function useChat(): UseChatReturn {
   const deleteSession = useCallback((id: string) => {
     setSessions((prev) => {
       const remaining = prev.filter((s) => s.id !== id);
-      // If we just deleted the active session, hop to the next-most-recent
-      // one (or null if there's nothing left).
       setActiveId((current) => {
         if (current !== id) return current;
         return remaining[0]?.id ?? null;
@@ -126,8 +175,7 @@ export function useChat(): UseChatReturn {
       if (!trimmed) return;
       if (isStreaming) return;
 
-      // Ensure a session exists; create one on the fly if the user hits
-      // Send before clicking "New chat".
+      // Ensure a session exists.
       let targetSessionId = activeId;
       if (!targetSessionId) {
         const session = makeSession();
@@ -142,8 +190,7 @@ export function useChat(): UseChatReturn {
         timestamp: Date.now(),
       };
 
-      // Optimistic append — user sees their own message immediately while
-      // the API call is in flight.
+      // Optimistic append so the user sees their message immediately.
       setSessions((prev) =>
         prev.map((s) => {
           if (s.id !== targetSessionId) return s;
@@ -162,47 +209,91 @@ export function useChat(): UseChatReturn {
 
       setIsStreaming(true);
       setError(null);
+      setStatus(null);
+
+      const toolCtx: ToolExecutionContext = {
+        symbol: selectedSymbol,
+        timeframe,
+        replaceOrAddIndicator,
+        cryptoUniverse: new Set(allSymbols),
+      };
 
       try {
-        // Build history fresh from the latest sessions snapshot so we
-        // don't miss the user message we just optimistically appended.
-        const latest =
-          (await new Promise<ChatSession | null>((resolve) => {
-            setSessions((curr) => {
-              const found = curr.find((s) => s.id === targetSessionId) ?? null;
-              resolve(found);
-              return curr;
+        // Build the API message history: persisted user/assistant turns +
+        // the new user message.
+        const persisted = (active?.messages ?? []).slice(-HISTORY_WINDOW);
+        const workingHistory: APIMessage[] = [
+          ...persisted.map<APIMessage>((m) =>
+            m.role === 'user'
+              ? { role: 'user', content: m.content }
+              : { role: 'assistant', content: m.content },
+          ),
+          { role: 'user', content: trimmed },
+        ];
+
+        let finalReply = '';
+        let finalGrounding: ChatMessage['grounding'] = null;
+        let round = 0;
+
+        while (round < MAX_TOOL_ROUNDS) {
+          round++;
+          const resp = await fetch('/api/chat', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ messages: workingHistory, context }),
+          });
+
+          if (!resp.ok) {
+            const errData = await resp.json().catch(() => ({}));
+            throw new Error(
+              (errData as { error?: string }).error ??
+                `Server error ${resp.status}`,
+            );
+          }
+
+          const data = (await resp.json()) as APIResponse;
+
+          if (data.toolCall) {
+            // Surface "what I'm doing" while the tool runs — even though
+            // the actual store mutation is synchronous, the model has yet
+            // to compose its follow-up reply so the user sees a step.
+            const call: ToolCall = {
+              name: data.toolCall.name,
+              args: data.toolCall.args ?? {},
+            };
+            setStatus(toolStatusLabel(call));
+            const toolResult = await executeChatTool(call, toolCtx);
+            workingHistory.push({
+              role: 'assistant_tool',
+              name: call.name,
+              args: call.args,
+              thoughtSignature: data.toolCall.thoughtSignature,
             });
-          })) ?? null;
+            workingHistory.push({
+              role: 'tool',
+              name: call.name,
+              response: toolResult,
+            });
+            continue;
+          }
 
-        const historySource = latest ? latest.messages : [userMsg];
-        const historyForApi = historySource
-          .slice(-HISTORY_WINDOW)
-          .map((m) => ({ role: m.role, content: m.content }));
-
-        const resp = await fetch('/api/chat', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ messages: historyForApi, context }),
-        });
-
-        if (!resp.ok) {
-          const data = await resp.json().catch(() => ({}));
-          throw new Error(
-            (data as { error?: string }).error ?? `Server error ${resp.status}`,
-          );
+          finalReply = (data.reply ?? '').trim();
+          finalGrounding = data.grounding ?? null;
+          break;
         }
 
-        const data = (await resp.json()) as {
-          reply?: string;
-          grounding?: ChatMessage['grounding'];
-        };
-        const reply = (data.reply ?? '').trim() || '(empty response)';
+        setStatus(null);
+
+        if (!finalReply) {
+          finalReply =
+            '(The assistant didn\'t produce a final text response after the tool call.)';
+        }
+
         const assistantMsg: ChatMessage = {
           role: 'assistant',
-          content: reply,
+          content: finalReply,
           timestamp: Date.now(),
-          grounding: data.grounding ?? null,
+          grounding: finalGrounding,
         };
 
         setSessions((prev) =>
@@ -221,15 +312,25 @@ export function useChat(): UseChatReturn {
         setError(err instanceof Error ? err.message : 'Failed to send');
       } finally {
         setIsStreaming(false);
+        setStatus(null);
       }
     },
-    [activeId, isStreaming],
+    [
+      active,
+      activeId,
+      isStreaming,
+      selectedSymbol,
+      timeframe,
+      replaceOrAddIndicator,
+      allSymbols,
+    ],
   );
 
   return {
     sessions,
     active,
     isStreaming,
+    status,
     error,
     selectSession,
     createSession,
