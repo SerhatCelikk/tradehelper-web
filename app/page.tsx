@@ -7,6 +7,7 @@ import WatchlistPanel from './components/WatchlistPanel';
 import IndicatorPerformancePanel from './components/IndicatorPerformancePanel';
 import AlertManager from './components/AlertManager';
 import DatabaseManager from './components/DatabaseManager';
+import ChatPanel from './components/ChatPanel';
 import { useAppStore } from './store/store';
 import { useMarketStream } from './hooks/useMarketStream';
 import { useIndicators } from './hooks/useIndicators';
@@ -67,6 +68,7 @@ export default function HomePage() {
       </main>
 
       <ConnectionStatus />
+      <ChatPanel />
 
       {alertModalOpen && (
         <AlertManager onClose={() => setAlertModalOpen(false)} />
